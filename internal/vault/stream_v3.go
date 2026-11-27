@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 )
@@ -36,22 +37,26 @@ func validateTombstones(names []string) error {
 }
 
 const (
-	streamV3Magic       = "PVLT0003"
-	streamV3CommitMagic = "PVLCMT03"
-	streamV3FooterSize  = 40
-	streamV3KeyMarker   = "KEYWRP01"
-	streamV3CoreSize    = 8 + 8 + saltSize + 8
-	streamV3KeySlotSize = 8 + nonceSize + 32 + 16
-	streamV3KeySlots    = 2
-	streamV3WrappedSize = streamV3CoreSize + streamV3KeySlots*streamV3KeySlotSize
+	streamV3Magic              = "PVLT0003"
+	streamV3CommitMagic        = "PVLCMT03"
+	streamV3FooterSize         = 40
+	streamV3KeyMarker          = "KEYWRP01"
+	streamV3CoreSize           = 8 + 8 + saltSize + 8
+	streamV3KeySlotSize        = 8 + nonceSize + 32 + 16
+	streamV3KeySlots           = 2
+	streamV3WrappedSize        = streamV3CoreSize + streamV3KeySlots*streamV3KeySlotSize
+	streamV3CheckpointInterval = 32
 )
 
 type streamV3Manifest struct {
+	IndexMode          string   `json:"index_mode,omitempty"`
 	Sequence           uint64   `json:"sequence"`
 	PreviousCommit     int64    `json:"previous_commit,omitempty"`
 	PreviousCommitHash string   `json:"previous_commit_hash,omitempty"`
 	TransactionDigest  string   `json:"transaction_digest,omitempty"`
 	Entries            []Entry  `json:"entries"`
+	Upserts            []Entry  `json:"upserts,omitempty"`
+	Deletes            []string `json:"deletes,omitempty"`
 	Tombstones         []string `json:"tombstones,omitempty"`
 	Tags               []Tag    `json:"tags,omitempty"`
 }
@@ -368,7 +373,14 @@ func isCompleteStreamV3Footer(file *os.File, fileSize, offset, headerSize int64)
 }
 
 func readStreamV3CommitAt(file *os.File, fileSize, footerOffset int64, header []byte, aead cipher.AEAD, headerSize int64) (streamV3Commit, []Entry, []Tag, bool) {
+	return readStreamV3CommitAtDepth(file, fileSize, footerOffset, header, aead, headerSize, 0)
+}
+
+func readStreamV3CommitAtDepth(file *os.File, fileSize, footerOffset int64, header []byte, aead cipher.AEAD, headerSize int64, depth int) (streamV3Commit, []Entry, []Tag, bool) {
 	var commit streamV3Commit
+	if depth > streamV3CheckpointInterval {
+		return commit, nil, nil, false
+	}
 	if footerOffset < headerSize || footerOffset+streamV3FooterSize > fileSize {
 		return commit, nil, nil, false
 	}
@@ -439,8 +451,65 @@ func readStreamV3CommitAt(file *os.File, fileSize, footerOffset int64, header []
 			return streamV3Commit{}, nil, nil, false
 		}
 	}
-	entries, tags, err := parseStreamManifestWithHeader(plain, commit.IndexOffset, headerSize)
-	if err != nil {
+	var entries []Entry
+	var tags []Tag
+	switch manifest.IndexMode {
+	case "", "snapshot": // Empty mode is the original PVLT0003 full-index format.
+		if len(manifest.Upserts) != 0 || len(manifest.Deletes) != 0 {
+			return streamV3Commit{}, nil, nil, false
+		}
+		entries, tags, err = parseStreamManifestWithHeader(plain, commit.IndexOffset, headerSize)
+		if err != nil {
+			return streamV3Commit{}, nil, nil, false
+		}
+	case "delta":
+		if commit.Sequence == 1 || len(manifest.Entries) != 0 || len(manifest.Upserts) > maxEntries || len(manifest.Deletes) > maxEntries {
+			return streamV3Commit{}, nil, nil, false
+		}
+		if err := validateTombstones(manifest.Deletes); err != nil {
+			return streamV3Commit{}, nil, nil, false
+		}
+		_, previousEntries, _, ok := readStreamV3CommitAtDepth(file, fileSize, commit.PreviousOffset, header, aead, headerSize, depth+1)
+		if !ok {
+			return streamV3Commit{}, nil, nil, false
+		}
+		byName := make(map[string]Entry, len(previousEntries)+len(manifest.Upserts))
+		for _, entry := range previousEntries {
+			byName[entry.Name] = entry
+		}
+		upsertNames := make(map[string]struct{}, len(manifest.Upserts))
+		for _, entry := range manifest.Upserts {
+			if _, exists := upsertNames[entry.Name]; exists {
+				return streamV3Commit{}, nil, nil, false
+			}
+			upsertNames[entry.Name] = struct{}{}
+		}
+		for _, name := range manifest.Deletes {
+			if _, exists := byName[name]; !exists {
+				return streamV3Commit{}, nil, nil, false
+			}
+			delete(byName, name)
+		}
+		for _, entry := range manifest.Upserts {
+			byName[entry.Name] = entry
+		}
+		if err := validateEntryCount(len(byName)); err != nil {
+			return streamV3Commit{}, nil, nil, false
+		}
+		entries = make([]Entry, 0, len(byName))
+		for _, entry := range byName {
+			entries = append(entries, entry)
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+		snapshot, err := json.Marshal(streamManifest{Entries: entries, Tags: manifest.Tags})
+		if err != nil {
+			return streamV3Commit{}, nil, nil, false
+		}
+		entries, tags, err = parseStreamManifestWithHeader(snapshot, commit.IndexOffset, headerSize)
+		if err != nil {
+			return streamV3Commit{}, nil, nil, false
+		}
+	default:
 		return streamV3Commit{}, nil, nil, false
 	}
 	return commit, entries, tags, true
@@ -656,13 +725,6 @@ func appendStreamV3Contents(file *os.File, header []byte, aead cipher.AEAD, oldB
 	for _, entry := range entries {
 		live[entry.Name] = struct{}{}
 	}
-	tombstones := make([]string, 0)
-	for name := range oldByName {
-		if _, exists := live[name]; !exists {
-			tombstones = append(tombstones, name)
-		}
-	}
-	sort.Strings(tombstones)
 	previousHash := ""
 	if previous.Sequence > 0 {
 		sum := sha256.Sum256(previous.Footer[:])
@@ -677,7 +739,26 @@ func appendStreamV3Contents(file *os.File, header []byte, aead cipher.AEAD, oldB
 		return err
 	}
 	transactionDigest := hex.EncodeToString(hasher.Sum(nil))
-	plain, err := json.Marshal(streamV3Manifest{Sequence: sequence, PreviousCommit: previous.FooterOffset, PreviousCommitHash: previousHash, TransactionDigest: transactionDigest, Entries: entries, Tombstones: tombstones, Tags: makeTagCatalog(tags, tagsFromEntries(entries))})
+	manifest := streamV3Manifest{Sequence: sequence, PreviousCommit: previous.FooterOffset, PreviousCommitHash: previousHash, TransactionDigest: transactionDigest, Tags: makeTagCatalog(tags, tagsFromEntries(entries))}
+	if previous.Sequence == 0 || sequence%streamV3CheckpointInterval == 0 {
+		manifest.IndexMode = "snapshot"
+		manifest.Entries = entries
+	} else {
+		manifest.IndexMode = "delta"
+		for _, entry := range entries {
+			old, exists := oldByName[entry.Name]
+			if !exists || old.Size != entry.Size || old.Hash != entry.Hash || old.Offset != entry.Offset || !reflect.DeepEqual(old.Tags, entry.Tags) {
+				manifest.Upserts = append(manifest.Upserts, entry)
+			}
+		}
+		for name := range oldByName {
+			if _, exists := live[name]; !exists {
+				manifest.Deletes = append(manifest.Deletes, name)
+			}
+		}
+		sort.Strings(manifest.Deletes)
+	}
+	plain, err := json.Marshal(manifest)
 	if err != nil {
 		return err
 	}

@@ -628,6 +628,85 @@ func TestPVLT0003AppendImportKeepsExistingPayloadOffset(t *testing.T) {
 	_ = reader.Close()
 }
 
+func TestPVLT0003DeltaIndexesAndCheckpoints(t *testing.T) {
+	collection, _ := createTestVault(t, []byte("checkpoint payload"))
+	file, err := os.OpenFile(collection, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	header, aead, entries, tags, previous, err := readStreamV3IndexFile(file, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]Entry{entries[0].Name: entries[0]}
+	for sequence := uint64(2); sequence <= streamV3CheckpointInterval+1; sequence++ {
+		nextEntries := entries
+		sources := map[string]io.Reader(nil)
+		if sequence == 2 {
+			nextEntries = nil
+		} else if sequence == 3 {
+			payload := []byte("replacement after tombstone")
+			entry := Entry{Name: "new.bin", Size: int64(len(payload)), Hash: hashString(payload)}
+			nextEntries = []Entry{entry}
+			sources = map[string]io.Reader{entry.Name: bytes.NewReader(payload)}
+		}
+		end := previous.FooterOffset + streamV3FooterSize
+		if _, err := file.Seek(end, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+		if err := appendStreamV3Contents(file, header, aead, byName, nextEntries, tags, sources, previous); err != nil {
+			t.Fatalf("append sequence %d: %v", sequence, err)
+		}
+		info, err := file.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		footerOffset := info.Size() - streamV3FooterSize
+		var ok bool
+		previous, entries, tags, ok = readStreamV3CommitAt(file, info.Size(), footerOffset, header, aead, int64(len(header)))
+		if !ok {
+			t.Fatalf("could not read sequence %d", sequence)
+		}
+		sealedIndex := make([]byte, previous.IndexLength)
+		if _, err := file.ReadAt(sealedIndex, previous.IndexOffset); err != nil {
+			t.Fatal(err)
+		}
+		plain, err := aead.Open(nil, sealedIndex[:nonceSize], sealedIndex[nonceSize:], streamV3IndexAAD(header))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var manifest streamV3Manifest
+		if err := json.Unmarshal(plain, &manifest); err != nil {
+			t.Fatal(err)
+		}
+		wantMode := "delta"
+		if sequence%streamV3CheckpointInterval == 0 {
+			wantMode = "snapshot"
+		}
+		if manifest.IndexMode != wantMode {
+			t.Fatalf("sequence %d uses index mode %q, want %q", sequence, manifest.IndexMode, wantMode)
+		}
+		if sequence == 2 && len(entries) != 0 {
+			t.Fatal("delta replay did not apply the tombstone")
+		}
+		if sequence == 3 && (len(entries) != 1 || entries[0].Name != "new.bin") {
+			t.Fatal("delta replay did not apply the upsert")
+		}
+		byName = make(map[string]Entry, len(entries))
+		for _, entry := range entries {
+			byName[entry.Name] = entry
+		}
+	}
+	finalHeader, _, finalEntries, _, finalCommit, err := readStreamV3IndexFile(file, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isWrappedStreamV3Header(finalHeader) || finalCommit.Sequence != streamV3CheckpointInterval+1 || len(finalEntries) != 1 || finalEntries[0].Name != "new.bin" {
+		t.Fatal("checkpoint chain did not reconstruct the latest collection")
+	}
+}
+
 func TestPVLT0003RejectsCorruptCompleteTransaction(t *testing.T) {
 	collection, _ := createTestVault(t, []byte("first committed object"))
 	root := t.TempDir()
@@ -895,16 +974,33 @@ func rewriteV3ManifestHashForTest(path, password, name, replacement string) erro
 		return err
 	}
 	defer file.Close()
-	header, aead, entries, tags, commit, err := readStreamV3IndexFile(file, password)
+	header, aead, _, _, commit, err := readStreamV3IndexFile(file, password)
 	if err != nil {
 		return err
 	}
-	for i := range entries {
-		if entries[i].Name == name {
-			entries[i].Hash = replacement
+	index := make([]byte, commit.IndexLength)
+	if _, err := file.ReadAt(index, commit.IndexOffset); err != nil {
+		return err
+	}
+	plain, err := aead.Open(nil, index[:nonceSize], index[nonceSize:], streamV3IndexAAD(header))
+	if err != nil {
+		return err
+	}
+	var manifest streamV3Manifest
+	if err := json.Unmarshal(plain, &manifest); err != nil {
+		return err
+	}
+	for i := range manifest.Entries {
+		if manifest.Entries[i].Name == name {
+			manifest.Entries[i].Hash = replacement
 		}
 	}
-	start := int64(streamHeaderSize)
+	for i := range manifest.Upserts {
+		if manifest.Upserts[i].Name == name {
+			manifest.Upserts[i].Hash = replacement
+		}
+	}
+	start := commit.HeaderSize
 	previousHash := ""
 	if commit.Sequence > 1 {
 		start = commit.PreviousOffset + streamV3FooterSize
@@ -915,7 +1011,9 @@ func rewriteV3ManifestHashForTest(path, password, name, replacement string) erro
 	if _, err := io.Copy(digest, io.NewSectionReader(file, start, commit.IndexOffset-start)); err != nil {
 		return err
 	}
-	plain, err := json.Marshal(streamV3Manifest{Sequence: commit.Sequence, PreviousCommit: commit.PreviousOffset, PreviousCommitHash: previousHash, TransactionDigest: hex.EncodeToString(digest.Sum(nil)), Entries: entries, Tags: tags})
+	manifest.PreviousCommitHash = previousHash
+	manifest.TransactionDigest = hex.EncodeToString(digest.Sum(nil))
+	plain, err = json.Marshal(manifest)
 	if err != nil {
 		return err
 	}
@@ -923,7 +1021,7 @@ func rewriteV3ManifestHashForTest(path, password, name, replacement string) erro
 	if _, err := rand.Read(nonce); err != nil {
 		return err
 	}
-	sealed := aead.Seal(nil, nonce, plain, header)
+	sealed := aead.Seal(nil, nonce, plain, streamV3IndexAAD(header))
 	block := append(nonce, sealed...)
 	if int64(len(block)) != commit.IndexLength {
 		return errors.New("test mutation changed index length")
