@@ -44,6 +44,7 @@ type streamV3Manifest struct {
 	Sequence           uint64   `json:"sequence"`
 	PreviousCommit     int64    `json:"previous_commit,omitempty"`
 	PreviousCommitHash string   `json:"previous_commit_hash,omitempty"`
+	TransactionDigest  string   `json:"transaction_digest,omitempty"`
 	Entries            []Entry  `json:"entries"`
 	Tombstones         []string `json:"tombstones,omitempty"`
 	Tags               []Tag    `json:"tags,omitempty"`
@@ -102,6 +103,7 @@ func readStreamV3IndexFile(file *os.File, password string) ([]byte, cipher.AEAD,
 }
 
 func findLatestStreamV3Commit(file *os.File, fileSize int64, header []byte, aead cipher.AEAD) (streamV3Commit, []Entry, []Tag, error) {
+	var invalidCompleteCommit bool
 	const scanChunk = 64 << 10
 	for end := fileSize; end > streamHeaderSize; {
 		start := end - scanChunk
@@ -118,9 +120,16 @@ func findLatestStreamV3Commit(file *os.File, fileSize int64, header []byte, aead
 			if string(buf[i:i+8]) != streamV3CommitMagic {
 				continue
 			}
-			commit, entries, tags, ok := readStreamV3CommitAt(file, fileSize, start+int64(i), header, aead)
+			candidateOffset := start + int64(i)
+			commit, entries, tags, ok := readStreamV3CommitAt(file, fileSize, candidateOffset, header, aead)
 			if ok {
+				if invalidCompleteCommit {
+					return streamV3Commit{}, nil, nil, errors.New("corrupt PVLT0003 commit follows the last valid snapshot")
+				}
 				return commit, entries, tags, nil
+			}
+			if isCompleteStreamV3Footer(file, fileSize, candidateOffset) {
+				invalidCompleteCommit = true
 			}
 		}
 		if start == streamHeaderSize {
@@ -128,7 +137,24 @@ func findLatestStreamV3Commit(file *os.File, fileSize int64, header []byte, aead
 		}
 		end = start + int64(len(streamV3CommitMagic)-1)
 	}
+	if invalidCompleteCommit {
+		return streamV3Commit{}, nil, nil, errors.New("corrupt PVLT0003 commit found")
+	}
 	return streamV3Commit{}, nil, nil, errors.New("no valid PVLT0003 commit found")
+}
+
+func isCompleteStreamV3Footer(file *os.File, fileSize, offset int64) bool {
+	if offset < streamHeaderSize || offset > fileSize-streamV3FooterSize {
+		return false
+	}
+	var footer [streamV3FooterSize]byte
+	if _, err := file.ReadAt(footer[:], offset); err != nil || string(footer[:8]) != streamV3CommitMagic {
+		return false
+	}
+	indexOffset := int64(binary.BigEndian.Uint64(footer[8:16]))
+	indexLength := int64(binary.BigEndian.Uint64(footer[16:24]))
+	sequence := binary.BigEndian.Uint64(footer[24:32])
+	return sequence > 0 && indexOffset >= streamHeaderSize && indexOffset <= offset && indexLength >= nonceSize+16 && indexLength <= maxIndexSize+nonceSize+16 && indexLength == offset-indexOffset
 }
 
 func readStreamV3CommitAt(file *os.File, fileSize, footerOffset int64, header []byte, aead cipher.AEAD) (streamV3Commit, []Entry, []Tag, bool) {
@@ -183,6 +209,22 @@ func readStreamV3CommitAt(file *os.File, fileSize, footerOffset int64, header []
 		}
 		previousHash := sha256.Sum256(previous[:])
 		if binary.BigEndian.Uint64(previous[24:32])+1 != commit.Sequence || manifest.PreviousCommitHash != hex.EncodeToString(previousHash[:]) {
+			return streamV3Commit{}, nil, nil, false
+		}
+	}
+	if manifest.TransactionDigest != "" {
+		transactionStart := int64(streamHeaderSize)
+		if commit.Sequence > 1 {
+			transactionStart = commit.PreviousOffset + streamV3FooterSize
+		}
+		if transactionStart > commit.IndexOffset {
+			return streamV3Commit{}, nil, nil, false
+		}
+		hasher := sha256.New()
+		if _, err := io.Copy(hasher, io.NewSectionReader(file, transactionStart, commit.IndexOffset-transactionStart)); err != nil {
+			return streamV3Commit{}, nil, nil, false
+		}
+		if manifest.TransactionDigest != hex.EncodeToString(hasher.Sum(nil)) {
 			return streamV3Commit{}, nil, nil, false
 		}
 	}
@@ -282,6 +324,13 @@ func appendStreamV3Contents(file *os.File, header []byte, aead cipher.AEAD, oldB
 	if err := validateEntryCount(len(entries)); err != nil {
 		return err
 	}
+	transactionStart, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	if previous.Sequence == 0 {
+		transactionStart = streamHeaderSize
+	}
 	for i := range entries {
 		entry := &entries[i]
 		if source, ok := sources[entry.Name]; ok {
@@ -320,16 +369,21 @@ func appendStreamV3Contents(file *os.File, header []byte, aead cipher.AEAD, oldB
 		sum := sha256.Sum256(previous.Footer[:])
 		previousHash = hex.EncodeToString(sum[:])
 	}
-	plain, err := json.Marshal(streamV3Manifest{Sequence: sequence, PreviousCommit: previous.FooterOffset, PreviousCommitHash: previousHash, Entries: entries, Tombstones: tombstones, Tags: makeTagCatalog(tags, tagsFromEntries(entries))})
+	indexOffset, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, io.NewSectionReader(file, transactionStart, indexOffset-transactionStart)); err != nil {
+		return err
+	}
+	transactionDigest := hex.EncodeToString(hasher.Sum(nil))
+	plain, err := json.Marshal(streamV3Manifest{Sequence: sequence, PreviousCommit: previous.FooterOffset, PreviousCommitHash: previousHash, TransactionDigest: transactionDigest, Entries: entries, Tombstones: tombstones, Tags: makeTagCatalog(tags, tagsFromEntries(entries))})
 	if err != nil {
 		return err
 	}
 	if len(plain) > maxIndexSize {
 		return errors.New("collection index exceeds the 16 MiB limit")
-	}
-	indexOffset, err := file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
 	}
 	nonce := make([]byte, nonceSize)
 	if _, err := rand.Read(nonce); err != nil {

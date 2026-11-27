@@ -2,7 +2,9 @@ package vault
 
 import (
 	"bytes"
-	"encoding/binary"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,18 +75,8 @@ func TestEncryptedBlockCorruptionIsRejected(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	session, err = (Service{}).OpenSession(collection, testPassword)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-	reader, err := session.Open("file.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-	if _, err := io.Copy(io.Discard, reader); err == nil {
-		t.Fatal("corrupted ciphertext was accepted")
+	if _, err := (Service{}).OpenSession(collection, testPassword); err == nil {
+		t.Fatal("corrupted ciphertext was accepted as a valid commit")
 	}
 }
 
@@ -487,6 +479,51 @@ func TestPVLT0003AppendImportKeepsExistingPayloadOffset(t *testing.T) {
 	_ = reader.Close()
 }
 
+func TestPVLT0003RejectsCorruptCompleteTransaction(t *testing.T) {
+	collection, _ := createTestVault(t, []byte("first committed object"))
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "new.bin"), []byte("second transaction payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Service{}).Create(CreateOptions{Source: source, Destination: filepath.Dir(collection), Key: testPassword}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry Entry
+	for _, item := range session.Items() {
+		if item.Name == "new.bin" {
+			entry = item
+		}
+	}
+	_ = session.Close()
+	file, err := os.OpenFile(collection, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	position := entry.Offset + 4 + nonceSize + 1
+	if _, err := file.ReadAt(b[:], position); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	b[0] ^= 0x40
+	if _, err := file.WriteAt(b[:], position); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	if _, err := (Service{}).OpenSession(collection, testPassword); err == nil || !strings.Contains(err.Error(), "corrupt PVLT0003 commit") {
+		t.Fatalf("expected a hard error for a complete corrupt commit, got %v", err)
+	}
+}
+
 func TestEntryCountLimitIsSymmetric(t *testing.T) {
 	entries := make([]Entry, maxEntries+1)
 	output, err := os.CreateTemp(t.TempDir(), "index-limit-*")
@@ -688,34 +725,7 @@ func TestRestoreRejectsSHA256Mismatch(t *testing.T) {
 	if err := os.WriteFile(target, []byte("keep-existing"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	header, aead, entries, tags, err := readStreamIndex(collection, testPassword)
-	if err != nil {
-		t.Fatal(err)
-	}
-	entries[0].Hash = strings.Repeat("0", 64)
-	file, err := os.OpenFile(collection, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var trailer [streamTrailerSize]byte
-	info, err := file.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.ReadAt(trailer[:], info.Size()-streamTrailerSize); err != nil {
-		t.Fatal(err)
-	}
-	indexOffset := int64(binary.BigEndian.Uint64(trailer[8:16]))
-	if err := file.Truncate(indexOffset); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.Seek(indexOffset, io.SeekStart); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeStreamIndex(file, header, aead, entries, tags); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
+	if err := rewriteV3ManifestHashForTest(collection, testPassword, "file.bin", strings.Repeat("0", 64)); err != nil {
 		t.Fatal(err)
 	}
 	if err := (Service{}).Restore(RestoreOptions{Collection: collection, Destination: destination, Key: testPassword}); err == nil {
@@ -728,4 +738,49 @@ func TestRestoreRejectsSHA256Mismatch(t *testing.T) {
 	if string(got) != "keep-existing" {
 		t.Fatalf("existing file changed: %q", got)
 	}
+}
+
+func rewriteV3ManifestHashForTest(path, password, name, replacement string) error {
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	header, aead, entries, tags, commit, err := readStreamV3IndexFile(file, password)
+	if err != nil {
+		return err
+	}
+	for i := range entries {
+		if entries[i].Name == name {
+			entries[i].Hash = replacement
+		}
+	}
+	start := int64(streamHeaderSize)
+	previousHash := ""
+	if commit.Sequence > 1 {
+		start = commit.PreviousOffset + streamV3FooterSize
+		previous := sha256.Sum256(commit.Footer[:])
+		previousHash = hex.EncodeToString(previous[:])
+	}
+	digest := sha256.New()
+	if _, err := io.Copy(digest, io.NewSectionReader(file, start, commit.IndexOffset-start)); err != nil {
+		return err
+	}
+	plain, err := json.Marshal(streamV3Manifest{Sequence: commit.Sequence, PreviousCommit: commit.PreviousOffset, PreviousCommitHash: previousHash, TransactionDigest: hex.EncodeToString(digest.Sum(nil)), Entries: entries, Tags: tags})
+	if err != nil {
+		return err
+	}
+	nonce := make([]byte, nonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return err
+	}
+	sealed := aead.Seal(nil, nonce, plain, header)
+	block := append(nonce, sealed...)
+	if int64(len(block)) != commit.IndexLength {
+		return errors.New("test mutation changed index length")
+	}
+	if _, err := file.WriteAt(block, commit.IndexOffset); err != nil {
+		return err
+	}
+	return file.Sync()
 }
