@@ -181,6 +181,15 @@ func (Service) Create(options CreateOptions) (CreateResult, error) {
 			return result, err
 		}
 		isV3 = true
+	} else if !isWrappedStreamV3Header(header) {
+		if err := upgradeStreamV3ToWrapped(collectionPath, options.Key); err != nil {
+			for _, source := range sources {
+				if closer, ok := source.(io.Closer); ok {
+					_ = closer.Close()
+				}
+			}
+			return result, err
+		}
 	}
 	var writeErr error
 	if isV3 {
@@ -379,8 +388,70 @@ func (Service) Compact(path, key string) error {
 		}
 	} else if string(magic[:]) != streamV3Magic {
 		return errors.New("compaction requires a PVLT0002 or PVLT0003 collection")
+	} else {
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		header := make([]byte, streamV3WrappedSize)
+		n, readErr := file.Read(header)
+		_ = file.Close()
+		if readErr != nil && readErr != io.EOF {
+			return readErr
+		}
+		if !isWrappedStreamV3Header(header[:n]) {
+			if err := upgradeStreamV3ToWrapped(path, key); err != nil {
+				return err
+			}
+		}
 	}
 	return compactStreamV3(path, key)
+}
+
+// ChangePassword rewraps the collection DEK without rewriting item payloads.
+func (Service) ChangePassword(path, currentPassword, newPassword string) error {
+	unlock, err := lockCollection(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := ensureStreamFormatLocked(path, currentPassword); err != nil {
+		return err
+	}
+	var magic [8]byte
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	_, readErr := io.ReadFull(file, magic[:])
+	_ = file.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if string(magic[:]) == streamMagic {
+		if err := upgradeStreamV2ToV3(path, currentPassword); err != nil {
+			return err
+		}
+	} else if string(magic[:]) == streamV3Magic {
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		header := make([]byte, streamV3WrappedSize)
+		n, readErr := file.Read(header)
+		_ = file.Close()
+		if readErr != nil && readErr != io.EOF {
+			return readErr
+		}
+		if !isWrappedStreamV3Header(header[:n]) {
+			if err := upgradeStreamV3ToWrapped(path, currentPassword); err != nil {
+				return err
+			}
+		}
+	} else {
+		return errors.New("password changes require a streaming collection")
+	}
+	return rewrapStreamV3Key(path, currentPassword, newPassword)
 }
 
 func (Service) AddTag(path, key, tag string, names []string) (int, error) {

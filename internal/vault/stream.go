@@ -560,6 +560,11 @@ func rewriteStreamWithTags(path string, password string, entries []Entry, tags [
 		return appendStreamV3Transaction(path, password, entries, tags, nil)
 	}
 	if len(header) >= 8 && string(header[:8]) == streamV3Magic {
+		if !isWrappedStreamV3Header(header) {
+			if err := upgradeStreamV3ToWrapped(path, password); err != nil {
+				return err
+			}
+		}
 		return appendStreamV3Transaction(path, password, entries, tags, nil)
 	}
 	return writeStreamAtomically(path, header, aead, oldEntries, entries, tags, nil)

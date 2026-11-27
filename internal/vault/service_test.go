@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -436,6 +437,154 @@ func TestPVLT0002UpgradesOnFirstMutation(t *testing.T) {
 	_ = file.Close()
 	if string(magic[:]) != streamV3Magic {
 		t.Fatalf("expected first mutation to upgrade to PVLT0003, got %q", magic)
+	}
+}
+
+func TestChangePasswordRewrapsDEKWithoutRewritingPayload(t *testing.T) {
+	want := bytes.Repeat([]byte("password rotation keeps payload"), 1024)
+	collection, _ := createTestVault(t, want)
+	session, err := (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	before, err := os.Stat(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPassword := "rotated-password"
+	if err := (Service{}).ChangePassword(collection, testPassword, newPassword); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() != after.Size() {
+		t.Fatalf("password change altered container size: before=%d after=%d", before.Size(), after.Size())
+	}
+	if _, err := (Service{}).OpenSession(collection, testPassword); err == nil {
+		t.Fatal("old password still opens the collection")
+	}
+	updated, err := (Service{}).OpenSession(collection, newPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := updated.Open("file.bin")
+	if err != nil {
+		_ = updated.Close()
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	_ = reader.Close()
+	_ = updated.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("password change modified encrypted payload")
+	}
+	oldReader, err := session.Open("file.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldData, err := io.ReadAll(oldReader)
+	_ = oldReader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(oldData, want) {
+		t.Fatal("existing snapshot stopped working after password change")
+	}
+}
+
+func TestChangePasswordMigratesPVLT0002(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.vault")
+	want := []byte("keep this v2 payload")
+	header, aead, err := newStreamCipher(testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := Entry{Name: "old.bin", Size: int64(len(want)), Hash: hashString(want)}
+	if err := writeInitialStream(path, header, aead, []Entry{entry}, nil, map[string]io.Reader{"old.bin": bytes.NewReader(want)}); err != nil {
+		t.Fatal(err)
+	}
+	newPassword := "v3-password"
+	if err := (Service{}).ChangePassword(path, testPassword, newPassword); err != nil {
+		t.Fatal(err)
+	}
+	session, err := (Service{}).OpenSession(path, newPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	reader, err := session.Open("old.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("PVLT0002 migration changed file content")
+	}
+}
+
+func TestChangePasswordMigratesDirectKeyPVLT0003WithoutReencryptingPayload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "direct-v3.vault")
+	data := bytes.Repeat([]byte("legacy PVLT0003 payload"), 64)
+	salt := bytes.Repeat([]byte{0x5a}, saltSize)
+	var rounds [8]byte
+	binary.BigEndian.PutUint64(rounds[:], iterations)
+	header := append([]byte(streamV3Magic), salt...)
+	header = append(header, rounds[:]...)
+	aead, err := streamAEAD(testPassword, salt, iterations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := Entry{Name: "legacy.bin", Size: int64(len(data)), Hash: hashString(data)}
+	if err := createStreamV3Atomically(path, header, aead, []Entry{entry}, nil, map[string]io.Reader{"legacy.bin": bytes.NewReader(data)}); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, legacyEntries, _, _, err := readStreamV3IndexFile(legacy, testPassword)
+	if err != nil {
+		_ = legacy.Close()
+		t.Fatal(err)
+	}
+	oldRecord := make([]byte, encodedRecordSize(entry.Size))
+	if _, err := legacy.ReadAt(oldRecord, legacyEntries[0].Offset); err != nil {
+		_ = legacy.Close()
+		t.Fatal(err)
+	}
+	_ = legacy.Close()
+
+	newPassword := "wrapped-v3-password"
+	if err := (Service{}).ChangePassword(path, testPassword, newPassword); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, entries, _, _, err := readStreamV3IndexFile(migrated, newPassword)
+	if err != nil {
+		_ = migrated.Close()
+		t.Fatal(err)
+	}
+	newRecord := make([]byte, encodedRecordSize(entries[0].Size))
+	if _, err := migrated.ReadAt(newRecord, entries[0].Offset); err != nil {
+		_ = migrated.Close()
+		t.Fatal(err)
+	}
+	_ = migrated.Close()
+	if !bytes.Equal(oldRecord, newRecord) {
+		t.Fatal("PVLT0003 migration re-encrypted the existing payload")
 	}
 }
 

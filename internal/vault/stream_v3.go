@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
@@ -38,6 +39,11 @@ const (
 	streamV3Magic       = "PVLT0003"
 	streamV3CommitMagic = "PVLCMT03"
 	streamV3FooterSize  = 40
+	streamV3KeyMarker   = "KEYWRP01"
+	streamV3CoreSize    = 8 + 8 + saltSize + 8
+	streamV3KeySlotSize = 8 + nonceSize + 32 + 16
+	streamV3KeySlots    = 2
+	streamV3WrappedSize = streamV3CoreSize + streamV3KeySlots*streamV3KeySlotSize
 )
 
 type streamV3Manifest struct {
@@ -55,20 +61,212 @@ type streamV3Commit struct {
 	Sequence                 uint64
 	PreviousOffset           int64
 	FooterOffset             int64
+	HeaderSize               int64
 	Footer                   [streamV3FooterSize]byte
 }
 
+type streamV3KeySlot struct {
+	Index      int
+	Generation uint64
+	DEK        []byte
+}
+
 func newStreamV3Cipher(password string) ([]byte, cipher.AEAD, error) {
+	dek := make([]byte, 32)
+	if _, err := rand.Read(dek); err != nil {
+		return nil, nil, err
+	}
+	return newStreamV3HeaderWithDEK(password, dek)
+}
+
+func newStreamV3HeaderWithDEK(password string, dek []byte) ([]byte, cipher.AEAD, error) {
 	salt := make([]byte, saltSize)
 	if _, err := rand.Read(salt); err != nil {
 		return nil, nil, err
 	}
-	header := append([]byte(streamV3Magic), salt...)
+	core := append([]byte(streamV3Magic), streamV3KeyMarker...)
+	core = append(core, salt...)
 	var rounds [8]byte
 	binary.BigEndian.PutUint64(rounds[:], iterations)
-	header = append(header, rounds[:]...)
-	aead, err := streamAEAD(password, salt, iterations)
+	core = append(core, rounds[:]...)
+	kekAEAD, err := streamAEAD(password, salt, iterations)
+	if err != nil {
+		return nil, nil, err
+	}
+	header := make([]byte, streamV3WrappedSize)
+	copy(header, core)
+	if err := writeStreamV3KeySlot(header, 0, 1, dek, kekAEAD); err != nil {
+		return nil, nil, err
+	}
+	aead, err := aeadFromKey(dek)
 	return header, aead, err
+}
+
+func legacyStreamV3DEK(header []byte, password string) ([]byte, error) {
+	salt, rounds, err := streamV3KDFParams(header)
+	if err != nil {
+		return nil, err
+	}
+	return deriveKey([]byte(password), salt, rounds), nil
+}
+
+func isWrappedStreamV3Header(header []byte) bool {
+	return len(header) >= streamV3CoreSize && string(header[:8]) == streamV3Magic && string(header[8:16]) == streamV3KeyMarker
+}
+
+func streamV3HeaderSizeFor(header []byte) int64 {
+	if isWrappedStreamV3Header(header) {
+		return streamV3WrappedSize
+	}
+	return streamHeaderSize
+}
+
+func streamV3IndexAAD(header []byte) []byte {
+	if isWrappedStreamV3Header(header) {
+		return header[:streamV3CoreSize]
+	}
+	return header
+}
+
+func aeadFromKey(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+func streamV3KDFParams(header []byte) (salt []byte, rounds int, err error) {
+	if isWrappedStreamV3Header(header) {
+		salt = header[16 : 16+saltSize]
+		rounds = int(binary.BigEndian.Uint64(header[16+saltSize : streamV3CoreSize]))
+	} else if len(header) >= streamHeaderSize && string(header[:8]) == streamV3Magic {
+		salt = header[8 : 8+saltSize]
+		rounds = int(binary.BigEndian.Uint64(header[8+saltSize : streamHeaderSize]))
+	} else {
+		return nil, 0, errors.New("invalid PVLT0003 header")
+	}
+	if rounds < 10000 || rounds > 2_000_000 {
+		return nil, 0, errors.New("invalid key derivation parameters")
+	}
+	return salt, rounds, nil
+}
+
+func openStreamV3Header(header []byte, password string) (cipher.AEAD, streamV3KeySlot, error) {
+	if !isWrappedStreamV3Header(header) {
+		salt, rounds, err := streamV3KDFParams(header)
+		if err != nil {
+			return nil, streamV3KeySlot{}, err
+		}
+		aead, err := streamAEAD(password, salt, rounds)
+		return aead, streamV3KeySlot{}, err
+	}
+	if len(header) < streamV3WrappedSize {
+		return nil, streamV3KeySlot{}, errors.New("truncated PVLT0003 key envelope")
+	}
+	salt, rounds, err := streamV3KDFParams(header)
+	if err != nil {
+		return nil, streamV3KeySlot{}, err
+	}
+	kekAEAD, err := streamAEAD(password, salt, rounds)
+	if err != nil {
+		return nil, streamV3KeySlot{}, err
+	}
+	var selected streamV3KeySlot
+	for slot := 0; slot < streamV3KeySlots; slot++ {
+		offset := streamV3CoreSize + slot*streamV3KeySlotSize
+		generation := binary.BigEndian.Uint64(header[offset : offset+8])
+		if generation == 0 {
+			continue
+		}
+		dek, err := kekAEAD.Open(nil, header[offset+8:offset+8+nonceSize], header[offset+8+nonceSize:offset+streamV3KeySlotSize], header[:streamV3CoreSize])
+		if err != nil || len(dek) != 32 {
+			continue
+		}
+		if generation > selected.Generation {
+			selected = streamV3KeySlot{Index: slot, Generation: generation, DEK: dek}
+		}
+	}
+	if selected.Generation == 0 {
+		return nil, streamV3KeySlot{}, errors.New("decryption failed (wrong key or damaged collection)")
+	}
+	aead, err := aeadFromKey(selected.DEK)
+	return aead, selected, err
+}
+
+func writeStreamV3KeySlot(header []byte, slot int, generation uint64, dek []byte, kekAEAD cipher.AEAD) error {
+	if slot < 0 || slot >= streamV3KeySlots || len(header) < streamV3WrappedSize || len(dek) != 32 {
+		return errors.New("invalid PVLT0003 key slot")
+	}
+	offset := streamV3CoreSize + slot*streamV3KeySlotSize
+	var gen [8]byte
+	binary.BigEndian.PutUint64(gen[:], generation)
+	copy(header[offset:offset+8], gen[:])
+	nonce := make([]byte, nonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return err
+	}
+	copy(header[offset+8:offset+8+nonceSize], nonce)
+	sealed := kekAEAD.Seal(nil, nonce, dek, header[:streamV3CoreSize])
+	copy(header[offset+8+nonceSize:offset+streamV3KeySlotSize], sealed)
+	return nil
+}
+
+func rewrapStreamV3Key(path, currentPassword, newPassword string) error {
+	file, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	header := make([]byte, streamV3WrappedSize)
+	if _, err := file.ReadAt(header, 0); err != nil {
+		return err
+	}
+	if !isWrappedStreamV3Header(header) {
+		return errors.New("PVLT0003 collection must use a wrapped DEK before password changes")
+	}
+	aead, selected, err := openStreamV3Header(header, currentPassword)
+	if err != nil {
+		return err
+	}
+	_ = aead
+	salt, rounds, err := streamV3KDFParams(header)
+	if err != nil {
+		return err
+	}
+	kekAEAD, err := streamAEAD(newPassword, salt, rounds)
+	if err != nil {
+		return err
+	}
+	maxGeneration := selected.Generation
+	for slot := 0; slot < streamV3KeySlots; slot++ {
+		offset := streamV3CoreSize + slot*streamV3KeySlotSize
+		if generation := binary.BigEndian.Uint64(header[offset : offset+8]); generation > maxGeneration {
+			maxGeneration = generation
+		}
+	}
+	target := 1 - selected.Index
+	if err := writeStreamV3KeySlot(header, target, maxGeneration+1, selected.DEK, kekAEAD); err != nil {
+		return err
+	}
+	targetOffset := int64(streamV3CoreSize + target*streamV3KeySlotSize)
+	if _, err := file.WriteAt(header[streamV3CoreSize+target*streamV3KeySlotSize:streamV3CoreSize+(target+1)*streamV3KeySlotSize], targetOffset); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	zeroSlot := make([]byte, streamV3KeySlotSize)
+	for slot := 0; slot < streamV3KeySlots; slot++ {
+		if slot == target {
+			continue
+		}
+		offset := int64(streamV3CoreSize + slot*streamV3KeySlotSize)
+		if _, err := file.WriteAt(zeroSlot, offset); err != nil {
+			return err
+		}
+	}
+	return file.Sync()
 }
 
 func readStreamV3IndexFile(file *os.File, password string) ([]byte, cipher.AEAD, []Entry, []Tag, streamV3Commit, error) {
@@ -80,35 +278,47 @@ func readStreamV3IndexFile(file *os.File, password string) ([]byte, cipher.AEAD,
 	if info.Size() < streamHeaderSize+streamV3FooterSize {
 		return nil, nil, nil, nil, zero, errors.New("not a supported PVLT0003 collection")
 	}
-	header := make([]byte, streamHeaderSize)
+	var first [streamV3CoreSize]byte
+	if _, err := file.ReadAt(first[:8], 0); err != nil {
+		return nil, nil, nil, nil, zero, err
+	}
+	if string(first[:8]) != streamV3Magic {
+		return nil, nil, nil, nil, zero, errors.New("not a supported PVLT0003 collection")
+	}
+	headerSize := int64(streamHeaderSize)
+	if info.Size() >= streamV3CoreSize {
+		if _, err := file.ReadAt(first[8:], 8); err != nil && err != io.EOF {
+			return nil, nil, nil, nil, zero, err
+		}
+		if string(first[8:16]) == streamV3KeyMarker {
+			headerSize = streamV3WrappedSize
+		}
+	}
+	if info.Size() < headerSize+streamV3FooterSize {
+		return nil, nil, nil, nil, zero, errors.New("not a supported PVLT0003 collection")
+	}
+	header := make([]byte, headerSize)
 	if _, err := file.ReadAt(header, 0); err != nil {
 		return nil, nil, nil, nil, zero, err
 	}
-	if string(header[:8]) != streamV3Magic {
-		return nil, nil, nil, nil, zero, errors.New("not a supported PVLT0003 collection")
-	}
-	rounds := binary.BigEndian.Uint64(header[8+saltSize:])
-	if rounds < 10000 || rounds > 2_000_000 {
-		return nil, nil, nil, nil, zero, errors.New("invalid key derivation parameters")
-	}
-	aead, err := streamAEAD(password, header[8:8+saltSize], int(rounds))
+	aead, _, err := openStreamV3Header(header, password)
 	if err != nil {
 		return nil, nil, nil, nil, zero, err
 	}
-	commit, entries, tags, err := findLatestStreamV3Commit(file, info.Size(), header, aead)
+	commit, entries, tags, err := findLatestStreamV3Commit(file, info.Size(), header, aead, headerSize)
 	if err != nil {
 		return nil, nil, nil, nil, zero, err
 	}
 	return header, aead, entries, tags, commit, nil
 }
 
-func findLatestStreamV3Commit(file *os.File, fileSize int64, header []byte, aead cipher.AEAD) (streamV3Commit, []Entry, []Tag, error) {
+func findLatestStreamV3Commit(file *os.File, fileSize int64, header []byte, aead cipher.AEAD, headerSize int64) (streamV3Commit, []Entry, []Tag, error) {
 	var invalidCompleteCommit bool
 	const scanChunk = 64 << 10
-	for end := fileSize; end > streamHeaderSize; {
+	for end := fileSize; end > headerSize; {
 		start := end - scanChunk
-		if start < streamHeaderSize {
-			start = streamHeaderSize
+		if start < headerSize {
+			start = headerSize
 		}
 		buf := make([]byte, end-start)
 		n, err := file.ReadAt(buf, start)
@@ -121,18 +331,18 @@ func findLatestStreamV3Commit(file *os.File, fileSize int64, header []byte, aead
 				continue
 			}
 			candidateOffset := start + int64(i)
-			commit, entries, tags, ok := readStreamV3CommitAt(file, fileSize, candidateOffset, header, aead)
+			commit, entries, tags, ok := readStreamV3CommitAt(file, fileSize, candidateOffset, header, aead, headerSize)
 			if ok {
 				if invalidCompleteCommit {
 					return streamV3Commit{}, nil, nil, errors.New("corrupt PVLT0003 commit follows the last valid snapshot")
 				}
 				return commit, entries, tags, nil
 			}
-			if isCompleteStreamV3Footer(file, fileSize, candidateOffset) {
+			if isCompleteStreamV3Footer(file, fileSize, candidateOffset, headerSize) {
 				invalidCompleteCommit = true
 			}
 		}
-		if start == streamHeaderSize {
+		if start == headerSize {
 			break
 		}
 		end = start + int64(len(streamV3CommitMagic)-1)
@@ -143,8 +353,8 @@ func findLatestStreamV3Commit(file *os.File, fileSize int64, header []byte, aead
 	return streamV3Commit{}, nil, nil, errors.New("no valid PVLT0003 commit found")
 }
 
-func isCompleteStreamV3Footer(file *os.File, fileSize, offset int64) bool {
-	if offset < streamHeaderSize || offset > fileSize-streamV3FooterSize {
+func isCompleteStreamV3Footer(file *os.File, fileSize, offset, headerSize int64) bool {
+	if offset < headerSize || offset > fileSize-streamV3FooterSize {
 		return false
 	}
 	var footer [streamV3FooterSize]byte
@@ -154,12 +364,12 @@ func isCompleteStreamV3Footer(file *os.File, fileSize, offset int64) bool {
 	indexOffset := int64(binary.BigEndian.Uint64(footer[8:16]))
 	indexLength := int64(binary.BigEndian.Uint64(footer[16:24]))
 	sequence := binary.BigEndian.Uint64(footer[24:32])
-	return sequence > 0 && indexOffset >= streamHeaderSize && indexOffset <= offset && indexLength >= nonceSize+16 && indexLength <= maxIndexSize+nonceSize+16 && indexLength == offset-indexOffset
+	return sequence > 0 && indexOffset >= headerSize && indexOffset <= offset && indexLength >= nonceSize+16 && indexLength <= maxIndexSize+nonceSize+16 && indexLength == offset-indexOffset
 }
 
-func readStreamV3CommitAt(file *os.File, fileSize, footerOffset int64, header []byte, aead cipher.AEAD) (streamV3Commit, []Entry, []Tag, bool) {
+func readStreamV3CommitAt(file *os.File, fileSize, footerOffset int64, header []byte, aead cipher.AEAD, headerSize int64) (streamV3Commit, []Entry, []Tag, bool) {
 	var commit streamV3Commit
-	if footerOffset < streamHeaderSize || footerOffset+streamV3FooterSize > fileSize {
+	if footerOffset < headerSize || footerOffset+streamV3FooterSize > fileSize {
 		return commit, nil, nil, false
 	}
 	if _, err := file.ReadAt(commit.Footer[:], footerOffset); err != nil {
@@ -173,15 +383,16 @@ func readStreamV3CommitAt(file *os.File, fileSize, footerOffset int64, header []
 	commit.Sequence = binary.BigEndian.Uint64(commit.Footer[24:32])
 	commit.PreviousOffset = int64(binary.BigEndian.Uint64(commit.Footer[32:40]))
 	commit.FooterOffset = footerOffset
+	commit.HeaderSize = headerSize
 	maxIndex := int64(maxIndexSize + nonceSize + aead.Overhead())
-	if commit.Sequence == 0 || commit.IndexOffset < streamHeaderSize || commit.IndexOffset > footerOffset || commit.IndexLength < int64(nonceSize+aead.Overhead()) || commit.IndexLength > maxIndex || commit.IndexLength != footerOffset-commit.IndexOffset {
+	if commit.Sequence == 0 || commit.IndexOffset < headerSize || commit.IndexOffset > footerOffset || commit.IndexLength < int64(nonceSize+aead.Overhead()) || commit.IndexLength > maxIndex || commit.IndexLength != footerOffset-commit.IndexOffset {
 		return streamV3Commit{}, nil, nil, false
 	}
 	index := make([]byte, commit.IndexLength)
 	if _, err := file.ReadAt(index, commit.IndexOffset); err != nil {
 		return streamV3Commit{}, nil, nil, false
 	}
-	plain, err := aead.Open(nil, index[:nonceSize], index[nonceSize:], header)
+	plain, err := aead.Open(nil, index[:nonceSize], index[nonceSize:], streamV3IndexAAD(header))
 	if err != nil {
 		return streamV3Commit{}, nil, nil, false
 	}
@@ -200,7 +411,7 @@ func readStreamV3CommitAt(file *os.File, fileSize, footerOffset int64, header []
 			return streamV3Commit{}, nil, nil, false
 		}
 	} else {
-		if commit.PreviousOffset < streamHeaderSize || commit.PreviousOffset > footerOffset-streamV3FooterSize {
+		if commit.PreviousOffset < headerSize || commit.PreviousOffset > footerOffset-streamV3FooterSize {
 			return streamV3Commit{}, nil, nil, false
 		}
 		var previous [streamV3FooterSize]byte
@@ -213,7 +424,7 @@ func readStreamV3CommitAt(file *os.File, fileSize, footerOffset int64, header []
 		}
 	}
 	if manifest.TransactionDigest != "" {
-		transactionStart := int64(streamHeaderSize)
+		transactionStart := headerSize
 		if commit.Sequence > 1 {
 			transactionStart = commit.PreviousOffset + streamV3FooterSize
 		}
@@ -228,7 +439,7 @@ func readStreamV3CommitAt(file *os.File, fileSize, footerOffset int64, header []
 			return streamV3Commit{}, nil, nil, false
 		}
 	}
-	entries, tags, err := parseStreamManifestWithHeader(plain, commit.IndexOffset, streamHeaderSize)
+	entries, tags, err := parseStreamManifestWithHeader(plain, commit.IndexOffset, headerSize)
 	if err != nil {
 		return streamV3Commit{}, nil, nil, false
 	}
@@ -260,11 +471,11 @@ func appendStreamV3Transaction(path, password string, entries []Entry, tags []Ta
 }
 
 func upgradeStreamV2ToV3(path, password string) error {
-	header, aead, entries, tags, err := readStreamIndex(path, password)
+	oldHeader, _, entries, tags, err := readStreamIndex(path, password)
 	if err != nil {
 		return err
 	}
-	if len(header) < 8 || string(header[:8]) != streamMagic {
+	if len(oldHeader) < 8 || string(oldHeader[:8]) != streamMagic {
 		return errors.New("collection is not PVLT0002")
 	}
 	oldFile, err := os.Open(path)
@@ -278,8 +489,13 @@ func upgradeStreamV2ToV3(path, password string) error {
 	}
 	tempPath := temp.Name()
 	defer os.Remove(tempPath)
-	newHeader := append([]byte(nil), header...)
-	copy(newHeader[:8], streamV3Magic)
+	oldRounds := int(binary.BigEndian.Uint64(oldHeader[8+saltSize : streamHeaderSize]))
+	dek := deriveKey([]byte(password), oldHeader[8:8+saltSize], oldRounds)
+	newHeader, newAEAD, err := newStreamV3HeaderWithDEK(password, dek)
+	if err != nil {
+		_ = temp.Close()
+		return err
+	}
 	if _, err := temp.Write(newHeader); err != nil {
 		_ = temp.Close()
 		return err
@@ -307,7 +523,7 @@ func upgradeStreamV2ToV3(path, password string) error {
 	for i := range entries {
 		entries[i] = newEntries[entries[i].Name]
 	}
-	if err := appendStreamV3Contents(temp, newHeader, aead, newEntries, entries, tags, nil, streamV3Commit{}); err != nil {
+	if err := appendStreamV3Contents(temp, newHeader, newAEAD, newEntries, entries, tags, nil, streamV3Commit{}); err != nil {
 		_ = temp.Close()
 		return err
 	}
@@ -320,6 +536,89 @@ func upgradeStreamV2ToV3(path, password string) error {
 	return os.Rename(tempPath, path)
 }
 
+func upgradeStreamV3ToWrapped(path, password string) error {
+	oldFile, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer oldFile.Close()
+	oldHeader, _, entries, tags, _, err := readStreamV3IndexFile(oldFile, password)
+	if err != nil {
+		return err
+	}
+	if isWrappedStreamV3Header(oldHeader) {
+		return nil
+	}
+	dek, err := legacyStreamV3DEK(oldHeader, password)
+	if err != nil {
+		return err
+	}
+	newHeader, newAEAD, err := newStreamV3HeaderWithDEK(password, dek)
+	if err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), ".vault-v3-wrap-*")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if _, err := temp.Write(newHeader); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	ordered := append([]Entry(nil), entries...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Offset < ordered[j].Offset })
+	newEntries := make(map[string]Entry, len(entries))
+	for _, entry := range ordered {
+		position, err := temp.Seek(0, io.SeekCurrent)
+		if err != nil {
+			_ = temp.Close()
+			return err
+		}
+		if _, err := oldFile.Seek(entry.Offset, io.SeekStart); err != nil {
+			_ = temp.Close()
+			return err
+		}
+		if _, err := io.CopyN(temp, oldFile, encodedRecordSize(entry.Size)); err != nil {
+			_ = temp.Close()
+			return err
+		}
+		entry.Offset = position
+		newEntries[entry.Name] = entry
+	}
+	for i := range entries {
+		entries[i] = newEntries[entries[i].Name]
+	}
+	if err := appendStreamV3Contents(temp, newHeader, newAEAD, newEntries, entries, tags, nil, streamV3Commit{}); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := oldFile.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
+}
+
+func makeEntryReaders(file *os.File, aead cipher.AEAD, entries []Entry) map[string]io.Reader {
+	sources := make(map[string]io.Reader, len(entries))
+	for _, entry := range entries {
+		sources[entry.Name] = &entryReader{source: io.NewSectionReader(file, entry.Offset, encodedRecordSize(entry.Size)), aead: aead, entry: entry, remaining: entry.Size}
+	}
+	return sources
+}
+
+func closeEntryReaders(sources map[string]io.Reader) {
+	for _, source := range sources {
+		if reader, ok := source.(io.Closer); ok {
+			_ = reader.Close()
+		}
+	}
+}
+
 func appendStreamV3Contents(file *os.File, header []byte, aead cipher.AEAD, oldByName map[string]Entry, entries []Entry, tags []Tag, sources map[string]io.Reader, previous streamV3Commit) error {
 	if err := validateEntryCount(len(entries)); err != nil {
 		return err
@@ -329,7 +628,7 @@ func appendStreamV3Contents(file *os.File, header []byte, aead cipher.AEAD, oldB
 		return err
 	}
 	if previous.Sequence == 0 {
-		transactionStart = streamHeaderSize
+		transactionStart = int64(len(header))
 	}
 	for i := range entries {
 		entry := &entries[i]
@@ -389,7 +688,7 @@ func appendStreamV3Contents(file *os.File, header []byte, aead cipher.AEAD, oldB
 	if _, err := rand.Read(nonce); err != nil {
 		return err
 	}
-	sealed := aead.Seal(nil, nonce, plain, header)
+	sealed := aead.Seal(nil, nonce, plain, streamV3IndexAAD(header))
 	if _, err := file.Write(nonce); err != nil {
 		return err
 	}
