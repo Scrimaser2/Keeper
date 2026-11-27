@@ -68,7 +68,7 @@ func (service Service) OpenSession(path, password string) (*Session, error) {
 	if err := ensureStreamFormatLocked(path, password); err != nil {
 		return nil, err
 	}
-	file, err := os.Open(path)
+	file, err := openSnapshotFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +191,7 @@ func (reader *entryReader) Read(output []byte) (int, error) {
 func (reader *entryReader) loadChunk() error {
 	var sizeBytes [4]byte
 	if _, err := io.ReadFull(reader.source, sizeBytes[:]); err != nil {
-		return err
+		return asUnexpectedEOF(err)
 	}
 	chunkSize := int64(binary.BigEndian.Uint32(sizeBytes[:]))
 	expected := int64(streamChunkSize)
@@ -203,11 +203,11 @@ func (reader *entryReader) loadChunk() error {
 	}
 	var nonce [nonceSize]byte
 	if _, err := io.ReadFull(reader.source, nonce[:]); err != nil {
-		return err
+		return asUnexpectedEOF(err)
 	}
 	ciphertext := make([]byte, int(chunkSize)+reader.aead.Overhead())
 	if _, err := io.ReadFull(reader.source, ciphertext); err != nil {
-		return err
+		return asUnexpectedEOF(err)
 	}
 	plain, err := reader.aead.Open(nil, nonce[:], ciphertext, chunkAAD(reader.entry.Name, reader.chunk, reader.entry.Size))
 	if err != nil {
@@ -218,6 +218,13 @@ func (reader *entryReader) loadChunk() error {
 	reader.offset += chunkSize
 	reader.buffer = plain
 	return nil
+}
+
+func asUnexpectedEOF(err error) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return io.ErrUnexpectedEOF
+	}
+	return err
 }
 
 func (reader *entryReader) Close() error {

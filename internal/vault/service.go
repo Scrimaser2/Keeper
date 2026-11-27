@@ -3,6 +3,7 @@ package vault
 import (
 	"crypto/cipher"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -120,6 +121,9 @@ func (Service) Create(options CreateOptions) (CreateResult, error) {
 			return err
 		}
 		name := filepath.ToSlash(relative)
+		if path == input && entry.IsDir() {
+			return nil
+		}
 		if catalog.IsHiddenPath(name) {
 			if entry.IsDir() {
 				return filepath.SkipDir
@@ -241,13 +245,18 @@ func (Service) Restore(options RestoreOptions) error {
 			return err
 		}
 		tempPath := temp.Name()
-		_, copyErr := io.Copy(temp, reader)
+		hasher := sha256.New()
+		copied, copyErr := io.Copy(io.MultiWriter(temp, hasher), reader)
 		readerErr := reader.Close()
 		syncErr := temp.Sync()
 		fileErr := temp.Close()
 		if copyErr != nil {
 			_ = os.Remove(tempPath)
 			return copyErr
+		}
+		if copied != item.Size || hex.EncodeToString(hasher.Sum(nil)) != item.Hash {
+			_ = os.Remove(tempPath)
+			return fmt.Errorf("restored item %q failed size or SHA-256 verification", item.Name)
 		}
 		if readerErr != nil {
 			_ = os.Remove(tempPath)
