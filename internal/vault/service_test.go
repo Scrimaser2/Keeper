@@ -2,14 +2,16 @@ package vault
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -107,18 +109,73 @@ func TestTruncatedSnapshotReturnsUnexpectedEOF(t *testing.T) {
 	}
 }
 
-func TestSessionKeepsSnapshotAcrossWrite(t *testing.T) {
-	want := bytes.Repeat([]byte("snapshot"), 1024)
-	collection, _ := createTestVault(t, want)
+func TestTruncatedSnapshotAtChunkBoundaryReturnsUnexpectedEOF(t *testing.T) {
+	collection, _ := createTestVault(t, bytes.Repeat([]byte("b"), 2*streamChunkSize))
 	session, err := (Service{}).OpenSession(collection, testPassword)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer session.Close()
-	if _, err := (Service{}).CreateTag(collection, testPassword, "after-snapshot"); err != nil {
+	entry := session.Items()[0]
+	reader, err := session.Open(entry.Name)
+	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := session.Open("file.bin")
+	defer reader.Close()
+	if err := os.Truncate(collection, entry.Offset+encodedRecordSize(streamChunkSize)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, reader); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected unexpected EOF at encrypted block boundary, got %v", err)
+	}
+}
+
+func TestSessionKeepsSnapshotAcrossWrite(t *testing.T) {
+	root := t.TempDir()
+	source, destination := filepath.Join(root, "source"), filepath.Join(root, "container")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	want := bytes.Repeat([]byte("second-file"), 1024)
+	if err := os.WriteFile(filepath.Join(source, "a.bin"), []byte("first"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "b.bin"), want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Service{}).Create(CreateOptions{Source: source, Destination: destination, Key: testPassword}); err != nil {
+		t.Fatal(err)
+	}
+	collection := filepath.Join(destination, archiveName)
+	session, err := (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if err := (Service{}).Delete(collection, testPassword, "a.bin"); err != nil {
+		t.Fatal(err)
+	}
+	oldItems := session.Items()
+	newSession, err := (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newSession.Close()
+	var oldOffset, newOffset int64
+	for _, item := range oldItems {
+		if item.Name == "b.bin" {
+			oldOffset = item.Offset
+		}
+	}
+	for _, item := range newSession.Items() {
+		if item.Name == "b.bin" {
+			newOffset = item.Offset
+		}
+	}
+	if oldOffset == newOffset {
+		t.Fatalf("test setup did not move the second file: old=%d new=%d", oldOffset, newOffset)
+	}
+	reader, err := session.Open("b.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,6 +391,21 @@ func FuzzStreamIndexParser(f *testing.F) {
 	})
 }
 
+func FuzzDecryptedStreamManifest(f *testing.F) {
+	seed, err := json.Marshal(streamManifest{Entries: []Entry{{Name: "photo.jpg", Size: 0, Hash: strings.Repeat("0", 64), Offset: streamHeaderSize}}})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed, int64(streamHeaderSize+128))
+	f.Add([]byte("{}"), int64(0))
+	f.Fuzz(func(t *testing.T, plain []byte, indexOffset int64) {
+		if len(plain) > maxIndexSize || indexOffset < 0 {
+			t.Skip()
+		}
+		_, _, _ = parseStreamManifest(plain, indexOffset)
+	})
+}
+
 func BenchmarkStreamReadMemory(b *testing.B) {
 	root := b.TempDir()
 	source, destination := filepath.Join(root, "source"), filepath.Join(root, "container")
@@ -349,8 +421,13 @@ func BenchmarkStreamReadMemory(b *testing.B) {
 	}
 	path := filepath.Join(destination, archiveName)
 	b.ReportAllocs()
+	b.ReportMetric(0, "peak-heap-B")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		runtime.GC()
+		var before, sample runtime.MemStats
+		runtime.ReadMemStats(&before)
+		peak := before.HeapAlloc
 		session, err := (Service{}).OpenSession(path, testPassword)
 		if err != nil {
 			b.Fatal(err)
@@ -359,26 +436,73 @@ func BenchmarkStreamReadMemory(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if _, err := io.Copy(io.Discard, reader); err != nil {
-			b.Fatal(err)
+		buffer := make([]byte, streamChunkSize/4)
+		for {
+			_, readErr := reader.Read(buffer)
+			runtime.ReadMemStats(&sample)
+			if sample.HeapAlloc > peak {
+				peak = sample.HeapAlloc
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				b.Fatal(readErr)
+			}
 		}
+		b.ReportMetric(float64(peak-before.HeapAlloc), "peak-heap-B")
 		_ = reader.Close()
 		_ = session.Close()
 	}
 }
 
-func TestRestoreVerifiesSHA256(t *testing.T) {
-	want := []byte("verify-hash")
-	collection, destination := createTestVault(t, want)
-	if err := (Service{}).Restore(RestoreOptions{Collection: collection, Destination: destination, Key: testPassword}); err != nil {
+func TestRestoreRejectsSHA256Mismatch(t *testing.T) {
+	collection, destination := createTestVault(t, []byte("hash-me"))
+	if err := os.MkdirAll(destination, 0700); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(filepath.Join(destination, "file.bin"))
+	target := filepath.Join(destination, "file.bin")
+	if err := os.WriteFile(target, []byte("keep-existing"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	header, aead, entries, tags, err := readStreamIndex(collection, testPassword)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hash := sha256.Sum256(got)
-	if hex.EncodeToString(hash[:]) != hashString(want) {
-		t.Fatal("restored hash mismatch")
+	entries[0].Hash = strings.Repeat("0", 64)
+	file, err := os.OpenFile(collection, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var trailer [streamTrailerSize]byte
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.ReadAt(trailer[:], info.Size()-streamTrailerSize); err != nil {
+		t.Fatal(err)
+	}
+	indexOffset := int64(binary.BigEndian.Uint64(trailer[8:16]))
+	if err := file.Truncate(indexOffset); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Seek(indexOffset, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeStreamIndex(file, header, aead, entries, tags); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Service{}).Restore(RestoreOptions{Collection: collection, Destination: destination, Key: testPassword}); err == nil {
+		t.Fatal("restore accepted a validly encrypted index with a wrong item hash")
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "keep-existing" {
+		t.Fatalf("existing file changed: %q", got)
 	}
 }

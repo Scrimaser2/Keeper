@@ -421,17 +421,25 @@ func readStreamIndexFile(file *os.File, password string) ([]byte, cipher.AEAD, [
 	if err != nil {
 		return nil, nil, nil, nil, errors.New("decryption failed (wrong key or damaged collection)")
 	}
-	var manifest streamManifest
-	if err := json.Unmarshal(plain, &manifest); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("invalid collection index: %w", err)
-	}
-	if len(manifest.Entries) > 100_000 {
-		return nil, nil, nil, nil, errors.New("collection has too many items")
-	}
-	if err := validateStreamEntries(manifest.Entries, indexOffset); err != nil {
+	entries, tags, err := parseStreamManifest(plain, indexOffset)
+	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	return header, aead, manifest.Entries, makeTagCatalog(manifest.Tags, tagsFromEntries(manifest.Entries)), nil
+	return header, aead, entries, tags, nil
+}
+
+func parseStreamManifest(plain []byte, indexOffset int64) ([]Entry, []Tag, error) {
+	var manifest streamManifest
+	if err := json.Unmarshal(plain, &manifest); err != nil {
+		return nil, nil, fmt.Errorf("invalid collection index: %w", err)
+	}
+	if len(manifest.Entries) > 100_000 {
+		return nil, nil, errors.New("collection has too many items")
+	}
+	if err := validateStreamEntries(manifest.Entries, indexOffset); err != nil {
+		return nil, nil, err
+	}
+	return manifest.Entries, makeTagCatalog(manifest.Tags, tagsFromEntries(manifest.Entries)), nil
 }
 
 func validateStreamEntries(entries []Entry, indexOffset int64) error {
