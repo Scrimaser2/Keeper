@@ -72,6 +72,11 @@ func (Service) Create(options CreateOptions) (CreateResult, error) {
 	}
 
 	collectionPath := filepath.Join(output, archiveName)
+	unlock, err := lockCollection(collectionPath)
+	if err != nil {
+		return result, err
+	}
+	defer unlock()
 	var oldEntries []Entry
 	var tagCatalog []Tag
 	var header []byte
@@ -157,16 +162,7 @@ func (Service) Create(options CreateOptions) (CreateResult, error) {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	for name, path := range sourcePaths {
-		file, err := os.Open(path)
-		if err != nil {
-			for _, source := range sources {
-				if closer, ok := source.(io.Closer); ok {
-					_ = closer.Close()
-				}
-			}
-			return result, err
-		}
-		sources[name] = file
+		sources[name] = &lazyFileReader{path: path}
 	}
 	if err := writeStreamAtomically(collectionPath, header, aead, oldEntries, entries, tagCatalog, sources); err != nil {
 		for _, source := range sources {
@@ -182,7 +178,12 @@ func (Service) Create(options CreateOptions) (CreateResult, error) {
 		}
 	}
 	if options.ClearSource {
-		result.ClearedFiles, err = clearSourceFiles(input)
+		imported := make(map[string]string, len(sourcePaths))
+		for name, path := range sourcePaths {
+			entry, _ := findEntry(entries, name)
+			imported[path] = entry.Hash
+		}
+		result.ClearedFiles, err = clearImportedSourceFiles(imported)
 		if err != nil {
 			return result, fmt.Errorf("collection created, but source cleanup failed: %w", err)
 		}
@@ -213,12 +214,24 @@ func (Service) Restore(options RestoreOptions) error {
 	if err := os.MkdirAll(output, 0700); err != nil {
 		return err
 	}
+	rootInfo, err := os.Lstat(output)
+	if err != nil {
+		return err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return errors.New("restore destination must be a real directory")
+	}
 	for _, item := range session.Items() {
 		destination := filepath.Join(output, filepath.FromSlash(item.Name))
 		if !isWithin(output, destination) {
 			return fmt.Errorf("unsafe path in collection: %q", item.Name)
 		}
-		if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+		if err := makeSafeDirectories(output, filepath.Dir(destination)); err != nil {
+			return err
+		}
+		if info, err := os.Lstat(destination); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to overwrite symbolic link: %s", destination)
+		} else if err != nil && !os.IsNotExist(err) {
 			return err
 		}
 		reader, err := session.Open(item.Name)
@@ -273,6 +286,11 @@ func (Service) Open(path, key string) (Collection, error) {
 }
 
 func (Service) Delete(path, key, name string) error {
+	unlock, err := lockCollection(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := ensureStreamFormat(path, key); err != nil {
 		return err
 	}
@@ -293,6 +311,11 @@ func (Service) Delete(path, key, name string) error {
 }
 
 func (Service) AddTag(path, key, tag string, names []string) (int, error) {
+	unlock, err := lockCollection(path)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
 	if err := ensureStreamFormat(path, key); err != nil {
 		return 0, err
 	}
@@ -345,6 +368,11 @@ func (Service) ListTags(path, key string) ([]Tag, error) {
 }
 
 func (Service) CreateTag(path, key, name string) (Tag, error) {
+	unlock, err := lockCollection(path)
+	if err != nil {
+		return Tag{}, err
+	}
+	defer unlock()
 	if err := ensureStreamFormat(path, key); err != nil {
 		return Tag{}, err
 	}
@@ -379,6 +407,11 @@ func (Service) UpdateTag(path, key string, updated Tag) error {
 }
 
 func (Service) SaveTag(path, key string, updated Tag) (Tag, error) {
+	unlock, err := lockCollection(path)
+	if err != nil {
+		return Tag{}, err
+	}
+	defer unlock()
 	if err := ensureStreamFormat(path, key); err != nil {
 		return Tag{}, err
 	}
@@ -449,6 +482,11 @@ func (Service) SaveTag(path, key string, updated Tag) (Tag, error) {
 }
 
 func (Service) DeleteTag(path, key, tagID string) error {
+	unlock, err := lockCollection(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := ensureStreamFormat(path, key); err != nil {
 		return err
 	}
@@ -481,6 +519,11 @@ func (Service) RemoveTagFromItems(path, key, tagID string, names []string) (int,
 }
 
 func updateTagAssignments(path, key, tagID string, names []string, assign bool) (int, error) {
+	unlock, err := lockCollection(path)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
 	if err := ensureStreamFormat(path, key); err != nil {
 		return 0, err
 	}
@@ -625,25 +668,89 @@ func addFolderContents(root string, files map[string][]byte, seen map[[32]byte]i
 	})
 }
 
-func clearSourceFiles(root string) (int, error) {
+func clearImportedSourceFiles(imported map[string]string) (int, error) {
 	cleared := 0
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	for path, expectedHash := range imported {
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			continue
 		}
-		if entry.IsDir() {
-			return nil
+		if err != nil {
+			return cleared, err
 		}
-		if entry.Type()&os.ModeSymlink == 0 && !entry.Type().IsRegular() {
-			return fmt.Errorf("only regular files can be cleared: %s", path)
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		hashValue, _, err := hashFile(path)
+		if err != nil {
+			return cleared, err
+		}
+		if hashValue != expectedHash {
+			continue
 		}
 		if err := os.Remove(path); err != nil {
-			return err
+			return cleared, err
 		}
 		cleared++
+	}
+	return cleared, nil
+}
+
+type lazyFileReader struct {
+	path string
+	file *os.File
+}
+
+func (r *lazyFileReader) Read(p []byte) (int, error) {
+	if r.file == nil {
+		f, err := os.Open(r.path)
+		if err != nil {
+			return 0, err
+		}
+		r.file = f
+	}
+	n, err := r.file.Read(p)
+	if err == io.EOF {
+		_ = r.file.Close()
+		r.file = nil
+	}
+	return n, err
+}
+func (r *lazyFileReader) Close() error {
+	if r.file == nil {
 		return nil
-	})
-	return cleared, err
+	}
+	err := r.file.Close()
+	r.file = nil
+	return err
+}
+
+func makeSafeDirectories(root, target string) error {
+	rel, err := filepath.Rel(root, target)
+	if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return errors.New("unsafe destination path")
+	}
+	current := root
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "." || part == "" {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			if err := os.Mkdir(current, 0700); err != nil && !os.IsExist(err) {
+				return err
+			}
+			info, err = os.Lstat(current)
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("unsafe destination directory: %s", current)
+		}
+	}
+	return nil
 }
 
 func directoriesOverlap(first, second string) bool {
