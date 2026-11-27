@@ -48,6 +48,7 @@ type streamManifest struct {
 // Entry contents are authenticated and decrypted one 1 MiB block at a time.
 type Session struct {
 	path    string
+	file    *os.File
 	header  []byte
 	aead    cipher.AEAD
 	entries []Entry
@@ -55,17 +56,28 @@ type Session struct {
 	byName  map[string]Entry
 	mu      sync.RWMutex
 	closed  bool
+	readers int
 }
 
 func (service Service) OpenSession(path, password string) (*Session, error) {
-	if err := ensureStreamFormat(path, password); err != nil {
-		return nil, err
-	}
-	header, aead, entries, tags, err := readStreamIndex(path, password)
+	unlock, err := lockCollection(path)
 	if err != nil {
 		return nil, err
 	}
-	session := &Session{path: path, header: header, aead: aead, entries: entries, tags: tags, byName: make(map[string]Entry, len(entries))}
+	defer unlock()
+	if err := ensureStreamFormatLocked(path, password); err != nil {
+		return nil, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	header, aead, entries, tags, err := readStreamIndexFile(file, password)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	session := &Session{path: path, file: file, header: header, aead: aead, entries: entries, tags: tags, byName: make(map[string]Entry, len(entries))}
 	for _, entry := range entries {
 		session.byName[entry.Name] = entry
 	}
@@ -97,8 +109,8 @@ func (session *Session) Tags() []Tag {
 }
 
 func (session *Session) Open(name string) (io.ReadCloser, error) {
-	session.mu.RLock()
-	defer session.mu.RUnlock()
+	session.mu.Lock()
+	defer session.mu.Unlock()
 	if session.closed {
 		return nil, errors.New("collection session is closed")
 	}
@@ -106,15 +118,9 @@ func (session *Session) Open(name string) (io.ReadCloser, error) {
 	if !exists {
 		return nil, errors.New("item no longer exists in the collection")
 	}
-	file, err := os.Open(session.path)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := file.Seek(entry.Offset, io.SeekStart); err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-	return &entryReader{file: file, aead: session.aead, entry: entry, remaining: entry.Size}, nil
+	section := io.NewSectionReader(session.file, entry.Offset, encodedRecordSize(entry.Size))
+	session.readers++
+	return &entryReader{source: section, aead: session.aead, entry: entry, remaining: entry.Size, release: session.releaseReader}, nil
 }
 
 func (session *Session) Close() error {
@@ -132,11 +138,26 @@ func (session *Session) Close() error {
 	session.entries = nil
 	session.tags = nil
 	session.byName = nil
+	if session.file != nil && session.readers == 0 {
+		err := session.file.Close()
+		session.file = nil
+		return err
+	}
 	return nil
 }
 
+func (session *Session) releaseReader() {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.readers--
+	if session.closed && session.readers == 0 && session.file != nil {
+		_ = session.file.Close()
+		session.file = nil
+	}
+}
+
 type entryReader struct {
-	file      *os.File
+	source    io.Reader
 	aead      cipher.AEAD
 	entry     Entry
 	remaining int64
@@ -144,6 +165,7 @@ type entryReader struct {
 	buffer    []byte
 	offset    int64
 	closed    bool
+	release   func()
 }
 
 func (reader *entryReader) Read(output []byte) (int, error) {
@@ -168,7 +190,7 @@ func (reader *entryReader) Read(output []byte) (int, error) {
 
 func (reader *entryReader) loadChunk() error {
 	var sizeBytes [4]byte
-	if _, err := io.ReadFull(reader.file, sizeBytes[:]); err != nil {
+	if _, err := io.ReadFull(reader.source, sizeBytes[:]); err != nil {
 		return err
 	}
 	chunkSize := int64(binary.BigEndian.Uint32(sizeBytes[:]))
@@ -180,11 +202,11 @@ func (reader *entryReader) loadChunk() error {
 		return errors.New("invalid encrypted item block size")
 	}
 	var nonce [nonceSize]byte
-	if _, err := io.ReadFull(reader.file, nonce[:]); err != nil {
+	if _, err := io.ReadFull(reader.source, nonce[:]); err != nil {
 		return err
 	}
 	ciphertext := make([]byte, int(chunkSize)+reader.aead.Overhead())
-	if _, err := io.ReadFull(reader.file, ciphertext); err != nil {
+	if _, err := io.ReadFull(reader.source, ciphertext); err != nil {
 		return err
 	}
 	plain, err := reader.aead.Open(nil, nonce[:], ciphertext, chunkAAD(reader.entry.Name, reader.chunk, reader.entry.Size))
@@ -208,10 +230,24 @@ func (reader *entryReader) Close() error {
 	}
 	reader.buffer = nil
 	reader.aead = nil
-	return reader.file.Close()
+	reader.source = nil
+	if reader.release != nil {
+		reader.release()
+		reader.release = nil
+	}
+	return nil
 }
 
 func ensureStreamFormat(path, password string) error {
+	unlock, err := lockCollection(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return ensureStreamFormatLocked(path, password)
+}
+
+func ensureStreamFormatLocked(path, password string) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -324,6 +360,11 @@ func readStreamIndex(path, password string) ([]byte, cipher.AEAD, []Entry, []Tag
 		return nil, nil, nil, nil, err
 	}
 	defer file.Close()
+	return readStreamIndexFile(file, password)
+}
+
+func readStreamIndexFile(file *os.File, password string) ([]byte, cipher.AEAD, []Entry, []Tag, error) {
+	reader := io.NewSectionReader(file, 0, 1<<63-1)
 	info, err := file.Stat()
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -332,7 +373,7 @@ func readStreamIndex(path, password string) ([]byte, cipher.AEAD, []Entry, []Tag
 		return nil, nil, nil, nil, errors.New("not a supported streaming collection")
 	}
 	header := make([]byte, streamHeaderSize)
-	if _, err := io.ReadFull(file, header); err != nil {
+	if _, err := io.ReadFull(reader, header); err != nil {
 		return nil, nil, nil, nil, err
 	}
 	if string(header[:8]) != streamMagic {
@@ -346,11 +387,11 @@ func readStreamIndex(path, password string) ([]byte, cipher.AEAD, []Entry, []Tag
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	if _, err := file.Seek(info.Size()-streamTrailerSize, io.SeekStart); err != nil {
+	if _, err := reader.Seek(info.Size()-streamTrailerSize, io.SeekStart); err != nil {
 		return nil, nil, nil, nil, err
 	}
 	var trailer [streamTrailerSize]byte
-	if _, err := io.ReadFull(file, trailer[:]); err != nil {
+	if _, err := io.ReadFull(reader, trailer[:]); err != nil {
 		return nil, nil, nil, nil, err
 	}
 	if string(trailer[:8]) != streamIndexMagic {
@@ -362,11 +403,11 @@ func readStreamIndex(path, password string) ([]byte, cipher.AEAD, []Entry, []Tag
 	if indexOffset < streamHeaderSize || indexLength < int64(nonceSize+aead.Overhead()) || indexLength > maxEncryptedIndex || indexOffset > info.Size()-streamTrailerSize || indexLength != info.Size()-streamTrailerSize-indexOffset {
 		return nil, nil, nil, nil, errors.New("invalid collection index bounds")
 	}
-	if _, err := file.Seek(indexOffset, io.SeekStart); err != nil {
+	if _, err := reader.Seek(indexOffset, io.SeekStart); err != nil {
 		return nil, nil, nil, nil, err
 	}
 	indexBlock := make([]byte, indexLength)
-	if _, err := io.ReadFull(file, indexBlock); err != nil {
+	if _, err := io.ReadFull(reader, indexBlock); err != nil {
 		return nil, nil, nil, nil, err
 	}
 	plain, err := aead.Open(nil, indexBlock[:nonceSize], indexBlock[nonceSize:], header)

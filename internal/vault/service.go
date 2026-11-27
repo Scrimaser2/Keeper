@@ -82,7 +82,7 @@ func (Service) Create(options CreateOptions) (CreateResult, error) {
 	var header []byte
 	var aead cipher.AEAD
 	if _, err := os.Stat(collectionPath); err == nil {
-		if err := ensureStreamFormat(collectionPath, options.Key); err != nil {
+		if err := ensureStreamFormatLocked(collectionPath, options.Key); err != nil {
 			return result, err
 		}
 		header, aead, oldEntries, tagCatalog, err = readStreamIndex(collectionPath, options.Key)
@@ -180,7 +180,7 @@ func (Service) Create(options CreateOptions) (CreateResult, error) {
 	if options.ClearSource {
 		imported := make(map[string]string, len(sourcePaths))
 		for name, path := range sourcePaths {
-			entry, _ := findEntry(entries, name)
+			entry := entriesByName[name]
 			imported[path] = entry.Hash
 		}
 		result.ClearedFiles, err = clearImportedSourceFiles(imported)
@@ -202,9 +202,6 @@ func (Service) Restore(options RestoreOptions) error {
 	}
 	if directoriesOverlap(input, output) {
 		return errors.New("collection and destination must not overlap")
-	}
-	if err := ensureStreamFormat(input, options.Key); err != nil {
-		return err
 	}
 	session, err := (Service{}).OpenSession(input, options.Key)
 	if err != nil {
@@ -238,22 +235,35 @@ func (Service) Restore(options RestoreOptions) error {
 		if err != nil {
 			return err
 		}
-		file, err := os.OpenFile(destination, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+		temp, err := os.CreateTemp(filepath.Dir(destination), ".vault-restore-*")
 		if err != nil {
 			_ = reader.Close()
 			return err
 		}
-		_, copyErr := io.Copy(file, reader)
+		tempPath := temp.Name()
+		_, copyErr := io.Copy(temp, reader)
 		readerErr := reader.Close()
-		fileErr := file.Close()
+		syncErr := temp.Sync()
+		fileErr := temp.Close()
 		if copyErr != nil {
+			_ = os.Remove(tempPath)
 			return copyErr
 		}
 		if readerErr != nil {
+			_ = os.Remove(tempPath)
 			return readerErr
 		}
+		if syncErr != nil {
+			_ = os.Remove(tempPath)
+			return syncErr
+		}
 		if fileErr != nil {
+			_ = os.Remove(tempPath)
 			return fileErr
+		}
+		if err := os.Rename(tempPath, destination); err != nil {
+			_ = os.Remove(tempPath)
+			return err
 		}
 	}
 	return nil
@@ -291,7 +301,7 @@ func (Service) Delete(path, key, name string) error {
 		return err
 	}
 	defer unlock()
-	if err := ensureStreamFormat(path, key); err != nil {
+	if err := ensureStreamFormatLocked(path, key); err != nil {
 		return err
 	}
 	_, _, entries, _, err := readStreamIndex(path, key)
@@ -316,7 +326,7 @@ func (Service) AddTag(path, key, tag string, names []string) (int, error) {
 		return 0, err
 	}
 	defer unlock()
-	if err := ensureStreamFormat(path, key); err != nil {
+	if err := ensureStreamFormatLocked(path, key); err != nil {
 		return 0, err
 	}
 	_, _, entries, tags, err := readStreamIndex(path, key)
@@ -373,7 +383,7 @@ func (Service) CreateTag(path, key, name string) (Tag, error) {
 		return Tag{}, err
 	}
 	defer unlock()
-	if err := ensureStreamFormat(path, key); err != nil {
+	if err := ensureStreamFormatLocked(path, key); err != nil {
 		return Tag{}, err
 	}
 	name = strings.TrimSpace(name)
@@ -412,7 +422,7 @@ func (Service) SaveTag(path, key string, updated Tag) (Tag, error) {
 		return Tag{}, err
 	}
 	defer unlock()
-	if err := ensureStreamFormat(path, key); err != nil {
+	if err := ensureStreamFormatLocked(path, key); err != nil {
 		return Tag{}, err
 	}
 	updated.Name = strings.TrimSpace(updated.Name)
@@ -487,7 +497,7 @@ func (Service) DeleteTag(path, key, tagID string) error {
 		return err
 	}
 	defer unlock()
-	if err := ensureStreamFormat(path, key); err != nil {
+	if err := ensureStreamFormatLocked(path, key); err != nil {
 		return err
 	}
 	_, _, entries, tags, err := readStreamIndex(path, key)
@@ -524,7 +534,7 @@ func updateTagAssignments(path, key, tagID string, names []string, assign bool) 
 		return 0, err
 	}
 	defer unlock()
-	if err := ensureStreamFormat(path, key); err != nil {
+	if err := ensureStreamFormatLocked(path, key); err != nil {
 		return 0, err
 	}
 	_, _, entries, tags, err := readStreamIndex(path, key)
