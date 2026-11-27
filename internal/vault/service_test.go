@@ -320,6 +320,26 @@ func TestMigrationV1ToV2(t *testing.T) {
 	}
 }
 
+func TestEntryCountLimitIsSymmetric(t *testing.T) {
+	entries := make([]Entry, maxEntries+1)
+	output, err := os.CreateTemp(t.TempDir(), "index-limit-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = writeStreamIndex(output, nil, nil, entries, nil)
+	_ = output.Close()
+	if err == nil || !strings.Contains(err.Error(), "too many items") {
+		t.Fatalf("writer should reject %d entries, got %v", len(entries), err)
+	}
+	plain, err := json.Marshal(streamManifest{Entries: entries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := parseStreamManifest(plain, 1<<30); err == nil || !strings.Contains(err.Error(), "too many items") {
+		t.Fatalf("reader should reject %d entries, got %v", len(entries), err)
+	}
+}
+
 func TestImport100000FilesLoad(t *testing.T) {
 	if os.Getenv("PHOTOVAULT_LOAD_TEST") != "1" {
 		t.Skip("set PHOTOVAULT_LOAD_TEST=1 to run the 100,000-file import")

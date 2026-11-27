@@ -28,6 +28,7 @@ const (
 	streamRecordOver  = 4 + nonceSize + 16
 	maxIndexSize      = 16 << 20
 	maxLegacySize     = 128 << 20
+	maxEntries        = 100_000
 )
 
 // Entry describes one item without loading its contents into memory.
@@ -433,13 +434,20 @@ func parseStreamManifest(plain []byte, indexOffset int64) ([]Entry, []Tag, error
 	if err := json.Unmarshal(plain, &manifest); err != nil {
 		return nil, nil, fmt.Errorf("invalid collection index: %w", err)
 	}
-	if len(manifest.Entries) > 100_000 {
-		return nil, nil, errors.New("collection has too many items")
+	if err := validateEntryCount(len(manifest.Entries)); err != nil {
+		return nil, nil, err
 	}
 	if err := validateStreamEntries(manifest.Entries, indexOffset); err != nil {
 		return nil, nil, err
 	}
 	return manifest.Entries, makeTagCatalog(manifest.Tags, tagsFromEntries(manifest.Entries)), nil
+}
+
+func validateEntryCount(count int) error {
+	if count > maxEntries {
+		return errors.New("collection has too many items")
+	}
+	return nil
 }
 
 func validateStreamEntries(entries []Entry, indexOffset int64) error {
@@ -658,6 +666,9 @@ func writeEncryptedEntry(output *os.File, aead cipher.AEAD, entry Entry, source 
 }
 
 func writeStreamIndex(output *os.File, header []byte, aead cipher.AEAD, entries []Entry, tags []Tag) error {
+	if err := validateEntryCount(len(entries)); err != nil {
+		return err
+	}
 	indexOffset, err := output.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
