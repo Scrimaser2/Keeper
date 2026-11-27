@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -165,6 +166,8 @@ type entryReader struct {
 	chunk     uint64
 	buffer    []byte
 	offset    int64
+	hasher    hash.Hash
+	verified  bool
 	closed    bool
 	release   func()
 }
@@ -178,6 +181,9 @@ func (reader *entryReader) Read(output []byte) (int, error) {
 	}
 	if len(reader.buffer) == 0 {
 		if reader.remaining == 0 {
+			if err := reader.verifyHash(); err != nil {
+				return 0, err
+			}
 			return 0, io.EOF
 		}
 		if err := reader.loadChunk(); err != nil {
@@ -217,7 +223,29 @@ func (reader *entryReader) loadChunk() error {
 	reader.remaining -= chunkSize
 	reader.chunk++
 	reader.offset += chunkSize
+	if reader.hasher == nil {
+		reader.hasher = sha256.New()
+	}
+	_, _ = reader.hasher.Write(plain)
 	reader.buffer = plain
+	return nil
+}
+
+func (reader *entryReader) verifyHash() error {
+	if reader.verified {
+		return nil
+	}
+	reader.verified = true
+	if reader.entry.Hash == "" {
+		return nil
+	}
+	hasher := reader.hasher
+	if hasher == nil {
+		hasher = sha256.New()
+	}
+	if hex.EncodeToString(hasher.Sum(nil)) != reader.entry.Hash {
+		return errors.New("item failed SHA-256 verification")
+	}
 	return nil
 }
 

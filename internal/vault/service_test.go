@@ -76,8 +76,8 @@ func TestEncryptedBlockCorruptionIsRejected(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (Service{}).OpenSession(collection, testPassword); err == nil {
-		t.Fatal("corrupted ciphertext was accepted as a valid commit")
+	if err := (Service{}).Verify(collection, testPassword); err == nil {
+		t.Fatal("full integrity verification accepted corrupted ciphertext")
 	}
 }
 
@@ -498,6 +498,149 @@ func TestChangePasswordRewrapsDEKWithoutRewritingPayload(t *testing.T) {
 	}
 }
 
+func TestRotateDataKeyReencryptsPayloads(t *testing.T) {
+	want := bytes.Repeat([]byte("fresh DEK"), 4096)
+	collection, _ := createTestVault(t, want)
+	before, err := (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := before.Items()[0]
+	_ = before.Close()
+	oldFile, err := os.Open(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCiphertext := make([]byte, encodedRecordSize(entry.Size))
+	if _, err := oldFile.ReadAt(oldCiphertext, entry.Offset); err != nil {
+		_ = oldFile.Close()
+		t.Fatal(err)
+	}
+	_ = oldFile.Close()
+	if err := (Service{}).RotateDataKey(collection, testPassword); err != nil {
+		t.Fatal(err)
+	}
+	after, err := (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := after.Items()[0]
+	reader, err := after.Open(updated.Name)
+	if err != nil {
+		_ = after.Close()
+		t.Fatal(err)
+	}
+	got, readErr := io.ReadAll(reader)
+	_ = reader.Close()
+	_ = after.Close()
+	if readErr != nil || !bytes.Equal(got, want) {
+		t.Fatalf("rotated payload did not round-trip: %v", readErr)
+	}
+	newFile, err := os.Open(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCiphertext := make([]byte, encodedRecordSize(updated.Size))
+	if _, err := newFile.ReadAt(newCiphertext, updated.Offset); err != nil {
+		_ = newFile.Close()
+		t.Fatal(err)
+	}
+	_ = newFile.Close()
+	if bytes.Equal(oldCiphertext, newCiphertext) {
+		t.Fatal("full DEK rotation preserved the old encrypted payload")
+	}
+	if err := (Service{}).Verify(collection, testPassword); err != nil {
+		t.Fatalf("rotated collection failed integrity verification: %v", err)
+	}
+}
+
+func TestCompactionRejectsDamagedLivePayload(t *testing.T) {
+	collection, _ := createTestVault(t, []byte("must not compact corrupted data"))
+	session, err := (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := session.Items()[0]
+	_ = session.Close()
+	file, err := os.OpenFile(collection, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value [1]byte
+	position := entry.Offset + 4 + nonceSize + 1
+	if _, err := file.ReadAt(value[:], position); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	value[0] ^= 0x20
+	if _, err := file.WriteAt(value[:], position); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	before, err := os.ReadFile(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (Service{}).Compact(collection, testPassword); err == nil {
+		t.Fatal("compaction accepted a damaged live payload")
+	}
+	after, err := os.ReadFile(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("failed compaction replaced the original container")
+	}
+}
+
+func TestPVLT0002MigrationRejectsDamagedPayload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "damaged-v2.vault")
+	payload := []byte("must be authenticated before migration")
+	header, aead, err := newStreamCipher(testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := Entry{Name: "legacy.bin", Size: int64(len(payload)), Hash: hashString(payload)}
+	if err := writeInitialStream(path, header, aead, []Entry{entry}, nil, map[string]io.Reader{entry.Name: bytes.NewReader(payload)}); err != nil {
+		t.Fatal(err)
+	}
+	_, _, entries, _, err := readStreamIndex(path, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	position := entries[0].Offset + 4 + nonceSize + 1
+	var value [1]byte
+	if _, err := file.ReadAt(value[:], position); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	value[0] ^= 0x10
+	if _, err := file.WriteAt(value[:], position); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := upgradeStreamV2ToV3(path, testPassword); err == nil {
+		t.Fatal("migration accepted a damaged encrypted item")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("failed migration replaced the original container")
+	}
+}
+
 func TestChangePasswordMigratesPVLT0002(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.vault")
 	want := []byte("keep this v2 payload")
@@ -651,7 +794,7 @@ func TestPVLT0003DeltaIndexesAndCheckpoints(t *testing.T) {
 			nextEntries = []Entry{entry}
 			sources = map[string]io.Reader{entry.Name: bytes.NewReader(payload)}
 		}
-		end := previous.FooterOffset + streamV3FooterSize
+		end := previous.FooterOffset + previous.FooterSize
 		if _, err := file.Seek(end, io.SeekStart); err != nil {
 			t.Fatal(err)
 		}
@@ -662,7 +805,7 @@ func TestPVLT0003DeltaIndexesAndCheckpoints(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		footerOffset := info.Size() - streamV3FooterSize
+		footerOffset := info.Size() - streamV3CommitRecordSize
 		var ok bool
 		previous, entries, tags, ok = readStreamV3CommitAt(file, info.Size(), footerOffset, header, aead, int64(len(header)))
 		if !ok {
@@ -707,7 +850,7 @@ func TestPVLT0003DeltaIndexesAndCheckpoints(t *testing.T) {
 	}
 }
 
-func TestPVLT0003RejectsCorruptCompleteTransaction(t *testing.T) {
+func TestPVLT0003DefersItemCorruptionDetectionUntilRead(t *testing.T) {
 	collection, _ := createTestVault(t, []byte("first committed object"))
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
@@ -747,8 +890,106 @@ func TestPVLT0003RejectsCorruptCompleteTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = file.Close()
+	session, err = (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatalf("fast open should not reread encrypted payloads: %v", err)
+	}
+	reader, err := session.Open("new.bin")
+	if err != nil {
+		_ = session.Close()
+		t.Fatal(err)
+	}
+	_, readErr := io.Copy(io.Discard, reader)
+	_ = reader.Close()
+	_ = session.Close()
+	if readErr == nil || !strings.Contains(readErr.Error(), "authentication") {
+		t.Fatalf("expected item authentication failure on read, got %v", readErr)
+	}
+	if err := (Service{}).Verify(collection, testPassword); err == nil {
+		t.Fatal("full verification accepted a damaged item")
+	}
+}
+
+func TestPVLT0003CorruptFooterSignatureIsNotTreatedAsIncompleteTail(t *testing.T) {
+	collection, _ := createTestVault(t, []byte("footer integrity"))
+	file, err := os.OpenFile(collection, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, aead, entries, tags, previous, err := readStreamV3IndexFile(file, testPassword)
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	byName := map[string]Entry{entries[0].Name: entries[0]}
+	end := previous.FooterOffset + previous.FooterSize
+	if _, err := file.Seek(end, io.SeekStart); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := appendStreamV3Contents(file, header, aead, byName, entries, tags, nil, previous); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	footerOffset := info.Size() - streamV3CommitRecordSize
+	var signature [1]byte
+	if _, err := file.ReadAt(signature[:], footerOffset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	signature[0] ^= 0x01
+	if _, err := file.WriteAt(signature[:], footerOffset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	_ = file.Close()
 	if _, err := (Service{}).OpenSession(collection, testPassword); err == nil || !strings.Contains(err.Error(), "corrupt PVLT0003 commit") {
-		t.Fatalf("expected a hard error for a complete corrupt commit, got %v", err)
+		t.Fatalf("expected corrupt committed footer to be reported, got %v", err)
+	}
+}
+
+func TestPVLT0003UnsealedFooterIsTreatedAsIncompleteTail(t *testing.T) {
+	collection, _ := createTestVault(t, []byte("last confirmed version"))
+	file, err := os.OpenFile(collection, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, aead, entries, tags, previous, err := readStreamV3IndexFile(file, testPassword)
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	byName := map[string]Entry{entries[0].Name: entries[0]}
+	if _, err := file.Seek(previous.FooterOffset+previous.FooterSize, io.SeekStart); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := appendStreamV3Contents(file, header, aead, byName, entries, tags, nil, previous); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Truncate(info.Size() - streamV3CommitSealSize); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	session, err := (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatalf("unsealed commit should recover the previous version: %v", err)
+	}
+	defer session.Close()
+	if items := session.Items(); len(items) != 1 || items[0].Name != "file.bin" {
+		t.Fatal("recovery did not expose the last confirmed version")
 	}
 }
 
@@ -1000,19 +1241,25 @@ func rewriteV3ManifestHashForTest(path, password, name, replacement string) erro
 			manifest.Upserts[i].Hash = replacement
 		}
 	}
-	start := commit.HeaderSize
-	previousHash := ""
 	if commit.Sequence > 1 {
-		start = commit.PreviousOffset + streamV3FooterSize
 		previous := sha256.Sum256(commit.Footer[:])
-		previousHash = hex.EncodeToString(previous[:])
+		manifest.PreviousCommitHash = hex.EncodeToString(previous[:])
 	}
-	digest := sha256.New()
-	if _, err := io.Copy(digest, io.NewSectionReader(file, start, commit.IndexOffset-start)); err != nil {
-		return err
+	if manifest.IntegrityMode != "records" {
+		start := commit.HeaderSize
+		if commit.Sequence > 1 {
+			start = commit.PreviousOffset + streamV3FooterSize
+			var previousSeal [streamV3CommitSealSize]byte
+			if _, err := file.ReadAt(previousSeal[:], commit.PreviousOffset+streamV3FooterSize); err == nil && string(previousSeal[:]) == streamV3CommitSealMagic {
+				start = commit.PreviousOffset + streamV3CommitRecordSize
+			}
+		}
+		digest := sha256.New()
+		if _, err := io.Copy(digest, io.NewSectionReader(file, start, commit.IndexOffset-start)); err != nil {
+			return err
+		}
+		manifest.TransactionDigest = hex.EncodeToString(digest.Sum(nil))
 	}
-	manifest.PreviousCommitHash = previousHash
-	manifest.TransactionDigest = hex.EncodeToString(digest.Sum(nil))
 	plain, err = json.Marshal(manifest)
 	if err != nil {
 		return err

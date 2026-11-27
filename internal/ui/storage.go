@@ -23,8 +23,16 @@ type RestoreStorage interface {
 	Restore(options vault.RestoreOptions) error
 }
 
+type SecurityStorage interface {
+	ChangePassword(path, currentPassword, newPassword string) error
+	RotateDataKey(path, password string) error
+	Verify(path, password string) error
+	Compact(path, password string) error
+}
+
 type Storage interface {
 	LibraryStorage
 	CreateStorage
 	RestoreStorage
+	SecurityStorage
 }

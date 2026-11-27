@@ -34,6 +34,7 @@ func Run(storage Storage) error {
 		container.NewTabItem("Метки", library.BuildTags()),
 		container.NewTabItem("Создать", container.NewPadded(newCreateForm(window, storage))),
 		container.NewTabItem("Восстановить", container.NewPadded(newRestoreForm(window, storage))),
+		container.NewTabItem("Безопасность", container.NewPadded(newSecurityForm(window, storage))),
 	)
 	console, consoleOutput, consoleScroll := startupConsole()
 	var sequence []rune

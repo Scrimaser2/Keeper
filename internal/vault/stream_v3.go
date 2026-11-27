@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -39,7 +40,10 @@ func validateTombstones(names []string) error {
 const (
 	streamV3Magic              = "PVLT0003"
 	streamV3CommitMagic        = "PVLCMT03"
+	streamV3CommitSealMagic    = "PVLSEAL3"
 	streamV3FooterSize         = 40
+	streamV3CommitSealSize     = 16
+	streamV3CommitRecordSize   = streamV3FooterSize + streamV3CommitSealSize
 	streamV3KeyMarker          = "KEYWRP01"
 	streamV3CoreSize           = 8 + 8 + saltSize + 8
 	streamV3KeySlotSize        = 8 + nonceSize + 32 + 16
@@ -50,6 +54,7 @@ const (
 
 type streamV3Manifest struct {
 	IndexMode          string   `json:"index_mode,omitempty"`
+	IntegrityMode      string   `json:"integrity_mode,omitempty"`
 	Sequence           uint64   `json:"sequence"`
 	PreviousCommit     int64    `json:"previous_commit,omitempty"`
 	PreviousCommitHash string   `json:"previous_commit_hash,omitempty"`
@@ -67,6 +72,7 @@ type streamV3Commit struct {
 	PreviousOffset           int64
 	FooterOffset             int64
 	HeaderSize               int64
+	FooterSize               int64
 	Footer                   [streamV3FooterSize]byte
 }
 
@@ -74,6 +80,22 @@ type streamV3KeySlot struct {
 	Index      int
 	Generation uint64
 	DEK        []byte
+}
+
+func streamV3CommitSeal(footer []byte) []byte {
+	seal := make([]byte, streamV3CommitSealSize)
+	copy(seal[:8], streamV3CommitSealMagic)
+	sum := sha256.Sum256(footer)
+	copy(seal[8:], sum[:streamV3CommitSealSize-8])
+	return seal
+}
+
+func validStreamV3CommitSeal(footer, seal []byte) bool {
+	if len(footer) != streamV3FooterSize || len(seal) != streamV3CommitSealSize || string(seal[:8]) != streamV3CommitSealMagic {
+		return false
+	}
+	sum := sha256.Sum256(footer)
+	return subtle.ConstantTimeCompare(seal[8:], sum[:streamV3CommitSealSize-8]) == 1
 }
 
 func newStreamV3Cipher(password string) ([]byte, cipher.AEAD, error) {
@@ -331,6 +353,21 @@ func findLatestStreamV3Commit(file *os.File, fileSize int64, header []byte, aead
 			return streamV3Commit{}, nil, nil, err
 		}
 		buf = buf[:n]
+		for i := len(buf) - len(streamV3CommitSealMagic); i >= 0; i-- {
+			if string(buf[i:i+len(streamV3CommitSealMagic)]) != streamV3CommitSealMagic {
+				continue
+			}
+			footerOffset := start + int64(i) - streamV3FooterSize
+			if footerOffset < headerSize {
+				continue
+			}
+			var footer [streamV3FooterSize]byte
+			if _, err := file.ReadAt(footer[:8], footerOffset); err != nil || string(footer[:8]) != streamV3CommitMagic {
+				invalidCompleteCommit = true
+			} else if _, _, _, ok := readStreamV3CommitAt(file, fileSize, footerOffset, header, aead, headerSize); !ok {
+				invalidCompleteCommit = true
+			}
+		}
 		for i := len(buf) - len(streamV3CommitMagic); i >= 0; i-- {
 			if string(buf[i:i+8]) != streamV3CommitMagic {
 				continue
@@ -343,7 +380,7 @@ func findLatestStreamV3Commit(file *os.File, fileSize int64, header []byte, aead
 				}
 				return commit, entries, tags, nil
 			}
-			if isCompleteStreamV3Footer(file, fileSize, candidateOffset, headerSize) {
+			if isCompleteStreamV3Footer(file, fileSize, candidateOffset, header, aead, headerSize) {
 				invalidCompleteCommit = true
 			}
 		}
@@ -358,7 +395,7 @@ func findLatestStreamV3Commit(file *os.File, fileSize int64, header []byte, aead
 	return streamV3Commit{}, nil, nil, errors.New("no valid PVLT0003 commit found")
 }
 
-func isCompleteStreamV3Footer(file *os.File, fileSize, offset, headerSize int64) bool {
+func isCompleteStreamV3Footer(file *os.File, fileSize, offset int64, header []byte, aead cipher.AEAD, headerSize int64) bool {
 	if offset < headerSize || offset > fileSize-streamV3FooterSize {
 		return false
 	}
@@ -369,7 +406,35 @@ func isCompleteStreamV3Footer(file *os.File, fileSize, offset, headerSize int64)
 	indexOffset := int64(binary.BigEndian.Uint64(footer[8:16]))
 	indexLength := int64(binary.BigEndian.Uint64(footer[16:24]))
 	sequence := binary.BigEndian.Uint64(footer[24:32])
-	return sequence > 0 && indexOffset >= headerSize && indexOffset <= offset && indexLength >= nonceSize+16 && indexLength <= maxIndexSize+nonceSize+16 && indexLength == offset-indexOffset
+	if sequence == 0 || indexOffset < headerSize || indexOffset > offset || indexLength < int64(nonceSize+aead.Overhead()) || indexLength > int64(maxIndexSize+nonceSize+aead.Overhead()) || indexLength != offset-indexOffset {
+		return false
+	}
+	var seal [streamV3CommitSealSize]byte
+	sealedCommit := false
+	sealMarkerPresent := false
+	if offset+streamV3CommitRecordSize <= fileSize {
+		if _, err := file.ReadAt(seal[:], offset+streamV3FooterSize); err == nil {
+			sealMarkerPresent = string(seal[:8]) == streamV3CommitSealMagic
+			sealedCommit = validStreamV3CommitSeal(footer[:], seal[:])
+		}
+	}
+	if sealMarkerPresent {
+		return true
+	}
+	index := make([]byte, indexLength)
+	if _, err := file.ReadAt(index, indexOffset); err != nil {
+		return false
+	}
+	plain, err := aead.Open(nil, index[:nonceSize], index[nonceSize:], streamV3IndexAAD(header))
+	if err != nil {
+		return false
+	}
+	var manifest streamV3Manifest
+	if json.Unmarshal(plain, &manifest) != nil {
+		return false
+	}
+	// A new-format footer is committed only after its seal has been synced.
+	return manifest.IntegrityMode != "records" || sealedCommit
 }
 
 func readStreamV3CommitAt(file *os.File, fileSize, footerOffset int64, header []byte, aead cipher.AEAD, headerSize int64) (streamV3Commit, []Entry, []Tag, bool) {
@@ -396,6 +461,13 @@ func readStreamV3CommitAtDepth(file *os.File, fileSize, footerOffset int64, head
 	commit.PreviousOffset = int64(binary.BigEndian.Uint64(commit.Footer[32:40]))
 	commit.FooterOffset = footerOffset
 	commit.HeaderSize = headerSize
+	commit.FooterSize = streamV3FooterSize
+	if footerOffset+streamV3CommitRecordSize <= fileSize {
+		var seal [streamV3CommitSealSize]byte
+		if _, err := file.ReadAt(seal[:], footerOffset+streamV3FooterSize); err == nil && validStreamV3CommitSeal(commit.Footer[:], seal[:]) {
+			commit.FooterSize = streamV3CommitRecordSize
+		}
+	}
 	maxIndex := int64(maxIndexSize + nonceSize + aead.Overhead())
 	if commit.Sequence == 0 || commit.IndexOffset < headerSize || commit.IndexOffset > footerOffset || commit.IndexLength < int64(nonceSize+aead.Overhead()) || commit.IndexLength > maxIndex || commit.IndexLength != footerOffset-commit.IndexOffset {
 		return streamV3Commit{}, nil, nil, false
@@ -435,19 +507,11 @@ func readStreamV3CommitAtDepth(file *os.File, fileSize, footerOffset int64, head
 			return streamV3Commit{}, nil, nil, false
 		}
 	}
-	if manifest.TransactionDigest != "" {
-		transactionStart := headerSize
-		if commit.Sequence > 1 {
-			transactionStart = commit.PreviousOffset + streamV3FooterSize
-		}
-		if transactionStart > commit.IndexOffset {
-			return streamV3Commit{}, nil, nil, false
-		}
-		hasher := sha256.New()
-		if _, err := io.Copy(hasher, io.NewSectionReader(file, transactionStart, commit.IndexOffset-transactionStart)); err != nil {
-			return streamV3Commit{}, nil, nil, false
-		}
-		if manifest.TransactionDigest != hex.EncodeToString(hasher.Sum(nil)) {
+	if manifest.IntegrityMode != "" && manifest.IntegrityMode != "records" {
+		return streamV3Commit{}, nil, nil, false
+	}
+	if manifest.IntegrityMode == "records" {
+		if manifest.TransactionDigest != "" || commit.FooterSize != streamV3CommitRecordSize {
 			return streamV3Commit{}, nil, nil, false
 		}
 	}
@@ -525,7 +589,7 @@ func appendStreamV3Transaction(path, password string, entries []Entry, tags []Ta
 	if err != nil {
 		return err
 	}
-	end := previous.FooterOffset + streamV3FooterSize
+	end := previous.FooterOffset + previous.FooterSize
 	if err := file.Truncate(end); err != nil {
 		return err
 	}
@@ -540,7 +604,7 @@ func appendStreamV3Transaction(path, password string, entries []Entry, tags []Ta
 }
 
 func upgradeStreamV2ToV3(path, password string) error {
-	oldHeader, _, entries, tags, err := readStreamIndex(path, password)
+	oldHeader, oldAEAD, entries, tags, err := readStreamIndex(path, password)
 	if err != nil {
 		return err
 	}
@@ -573,6 +637,10 @@ func upgradeStreamV2ToV3(path, password string) error {
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Offset < ordered[j].Offset })
 	newEntries := make(map[string]Entry, len(entries))
 	for _, entry := range ordered {
+		if err := verifyEncryptedEntry(oldFile, oldAEAD, entry); err != nil {
+			_ = temp.Close()
+			return fmt.Errorf("verify item %q during PVLT0002 migration: %w", entry.Name, err)
+		}
 		position, err := temp.Seek(0, io.SeekCurrent)
 		if err != nil {
 			_ = temp.Close()
@@ -611,7 +679,7 @@ func upgradeStreamV3ToWrapped(path, password string) error {
 		return err
 	}
 	defer oldFile.Close()
-	oldHeader, _, entries, tags, _, err := readStreamV3IndexFile(oldFile, password)
+	oldHeader, oldAEAD, entries, tags, _, err := readStreamV3IndexFile(oldFile, password)
 	if err != nil {
 		return err
 	}
@@ -640,6 +708,10 @@ func upgradeStreamV3ToWrapped(path, password string) error {
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Offset < ordered[j].Offset })
 	newEntries := make(map[string]Entry, len(entries))
 	for _, entry := range ordered {
+		if err := verifyEncryptedEntry(oldFile, oldAEAD, entry); err != nil {
+			_ = temp.Close()
+			return fmt.Errorf("verify item %q during PVLT0003 migration: %w", entry.Name, err)
+		}
 		position, err := temp.Seek(0, io.SeekCurrent)
 		if err != nil {
 			_ = temp.Close()
@@ -680,6 +752,18 @@ func makeEntryReaders(file *os.File, aead cipher.AEAD, entries []Entry) map[stri
 	return sources
 }
 
+func verifyEncryptedEntry(file *os.File, aead cipher.AEAD, entry Entry) error {
+	reader := &entryReader{
+		source:    io.NewSectionReader(file, entry.Offset, encodedRecordSize(entry.Size)),
+		aead:      aead,
+		entry:     entry,
+		remaining: entry.Size,
+	}
+	_, err := io.Copy(io.Discard, reader)
+	_ = reader.Close()
+	return err
+}
+
 func closeEntryReaders(sources map[string]io.Reader) {
 	for _, source := range sources {
 		if reader, ok := source.(io.Closer); ok {
@@ -691,13 +775,6 @@ func closeEntryReaders(sources map[string]io.Reader) {
 func appendStreamV3Contents(file *os.File, header []byte, aead cipher.AEAD, oldByName map[string]Entry, entries []Entry, tags []Tag, sources map[string]io.Reader, previous streamV3Commit) error {
 	if err := validateEntryCount(len(entries)); err != nil {
 		return err
-	}
-	transactionStart, err := file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-	if previous.Sequence == 0 {
-		transactionStart = int64(len(header))
 	}
 	for i := range entries {
 		entry := &entries[i]
@@ -734,12 +811,7 @@ func appendStreamV3Contents(file *os.File, header []byte, aead cipher.AEAD, oldB
 	if err != nil {
 		return err
 	}
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, io.NewSectionReader(file, transactionStart, indexOffset-transactionStart)); err != nil {
-		return err
-	}
-	transactionDigest := hex.EncodeToString(hasher.Sum(nil))
-	manifest := streamV3Manifest{Sequence: sequence, PreviousCommit: previous.FooterOffset, PreviousCommitHash: previousHash, TransactionDigest: transactionDigest, Tags: makeTagCatalog(tags, tagsFromEntries(entries))}
+	manifest := streamV3Manifest{IntegrityMode: "records", Sequence: sequence, PreviousCommit: previous.FooterOffset, PreviousCommitHash: previousHash, Tags: makeTagCatalog(tags, tagsFromEntries(entries))}
 	if previous.Sequence == 0 || sequence%streamV3CheckpointInterval == 0 {
 		manifest.IndexMode = "snapshot"
 		manifest.Entries = entries
@@ -795,6 +867,12 @@ func appendStreamV3Contents(file *os.File, header []byte, aead cipher.AEAD, oldB
 	if _, err := file.Write(footer[:]); err != nil {
 		return err
 	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if _, err := file.Write(streamV3CommitSeal(footer[:])); err != nil {
+		return err
+	}
 	return file.Sync()
 }
 
@@ -814,6 +892,51 @@ func createStreamV3Atomically(path string, header []byte, aead cipher.AEAD, entr
 		return err
 	}
 	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
+}
+
+func rotateStreamV3DataKey(path, password string) error {
+	oldFile, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer oldFile.Close()
+	oldHeader, oldAEAD, entries, tags, err := readStreamIndexFile(oldFile, password)
+	if err != nil {
+		return err
+	}
+	if len(oldHeader) < 8 || (string(oldHeader[:8]) != streamMagic && string(oldHeader[:8]) != streamV3Magic) {
+		return errors.New("data-key rotation requires a streaming collection")
+	}
+	newHeader, newAEAD, err := newStreamV3Cipher(password)
+	if err != nil {
+		return err
+	}
+	sources := makeEntryReaders(oldFile, oldAEAD, entries)
+	temp, err := os.CreateTemp(filepath.Dir(path), ".vault-v3-key-rotation-*")
+	if err != nil {
+		closeEntryReaders(sources)
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if _, err := temp.Write(newHeader); err != nil {
+		_ = temp.Close()
+		closeEntryReaders(sources)
+		return err
+	}
+	if err := appendStreamV3Contents(temp, newHeader, newAEAD, nil, entries, tags, sources, streamV3Commit{}); err != nil {
+		_ = temp.Close()
+		closeEntryReaders(sources)
+		return err
+	}
+	closeEntryReaders(sources)
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := oldFile.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tempPath, path)
@@ -843,6 +966,10 @@ func compactStreamV3(path, password string) error {
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Offset < ordered[j].Offset })
 	updated := make(map[string]Entry, len(entries))
 	for _, entry := range ordered {
+		if err := verifyEncryptedEntry(file, aead, entry); err != nil {
+			_ = temp.Close()
+			return fmt.Errorf("verify item %q during compaction: %w", entry.Name, err)
+		}
 		position, err := temp.Seek(0, io.SeekCurrent)
 		if err != nil {
 			_ = temp.Close()

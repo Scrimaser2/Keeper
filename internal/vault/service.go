@@ -454,6 +454,43 @@ func (Service) ChangePassword(path, currentPassword, newPassword string) error {
 	return rewrapStreamV3Key(path, currentPassword, newPassword)
 }
 
+// RotateDataKey re-encrypts every live item with a fresh random DEK.
+func (Service) RotateDataKey(path, password string) error {
+	unlock, err := lockCollection(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := ensureStreamFormatLocked(path, password); err != nil {
+		return err
+	}
+	return rotateStreamV3DataKey(path, password)
+}
+
+// Verify reads and authenticates every live item in the collection.
+func (Service) Verify(path, password string) error {
+	session, err := (Service{}).OpenSession(path, password)
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+	for _, entry := range session.Items() {
+		reader, err := session.Open(entry.Name)
+		if err != nil {
+			return fmt.Errorf("verify item %q: %w", entry.Name, err)
+		}
+		_, readErr := io.Copy(io.Discard, reader)
+		closeErr := reader.Close()
+		if readErr != nil {
+			return fmt.Errorf("verify item %q: %w", entry.Name, readErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close item %q after verification: %w", entry.Name, closeErr)
+		}
+	}
+	return nil
+}
+
 func (Service) AddTag(path, key, tag string, names []string) (int, error) {
 	unlock, err := lockCollection(path)
 	if err != nil {
