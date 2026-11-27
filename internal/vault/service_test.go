@@ -155,14 +155,13 @@ func TestSessionKeepsSnapshotAcrossWrite(t *testing.T) {
 	if err := (Service{}).Delete(collection, testPassword, "a.bin"); err != nil {
 		t.Fatal(err)
 	}
-	oldItems := session.Items()
 	newSession, err := (Service{}).OpenSession(collection, testPassword)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer newSession.Close()
 	var oldOffset, newOffset int64
-	for _, item := range oldItems {
+	for _, item := range session.Items() {
 		if item.Name == "b.bin" {
 			oldOffset = item.Offset
 		}
@@ -172,8 +171,8 @@ func TestSessionKeepsSnapshotAcrossWrite(t *testing.T) {
 			newOffset = item.Offset
 		}
 	}
-	if oldOffset == newOffset {
-		t.Fatalf("test setup did not move the second file: old=%d new=%d", oldOffset, newOffset)
+	if oldOffset != newOffset {
+		t.Fatalf("append-only deletion unexpectedly moved live data: old=%d new=%d", oldOffset, newOffset)
 	}
 	reader, err := session.Open("b.bin")
 	if err != nil {
@@ -320,6 +319,174 @@ func TestMigrationV1ToV2(t *testing.T) {
 	}
 }
 
+func TestPVLT0003AppendRecoversCommittedSnapshot(t *testing.T) {
+	collection, _ := createTestVault(t, []byte("keep-me"))
+	file, err := os.OpenFile(collection, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, first, err := readStreamV3IndexFile(file, testPassword)
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("incomplete-transaction-tail")); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	session, err := (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = session.Close()
+	if _, err := (Service{}).CreateTag(collection, testPassword, "recovered"); err != nil {
+		t.Fatal(err)
+	}
+	file, err = os.Open(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	_, _, _, tags, second, err := readStreamV3IndexFile(file, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Sequence != first.Sequence+1 || second.PreviousOffset != first.FooterOffset {
+		t.Fatalf("commit chain did not advance correctly: first=%+v second=%+v", first, second)
+	}
+	if _, ok := findTagByName(tags, "recovered"); !ok {
+		t.Fatal("new committed metadata was not recovered")
+	}
+}
+
+func TestPVLT0003CompactionDropsDeletedPayload(t *testing.T) {
+	root := t.TempDir()
+	source, destination := filepath.Join(root, "source"), filepath.Join(root, "container")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	keep := bytes.Repeat([]byte("live"), 1024)
+	dead := bytes.Repeat([]byte("deleted"), 1024)
+	if err := os.WriteFile(filepath.Join(source, "a-dead.bin"), dead, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "b-live.bin"), keep, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Service{}).Create(CreateOptions{Source: source, Destination: destination, Key: testPassword}); err != nil {
+		t.Fatal(err)
+	}
+	collection := filepath.Join(destination, archiveName)
+	if err := (Service{}).Delete(collection, testPassword, "a-dead.bin"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (Service{}).Compact(collection, testPassword); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() >= before.Size() {
+		t.Fatalf("compaction did not reclaim space: before=%d after=%d", before.Size(), after.Size())
+	}
+	session, err := (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if got := len(session.Items()); got != 1 {
+		t.Fatalf("expected one live file after compaction, got %d", got)
+	}
+	reader, err := session.Open("b-live.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, keep) {
+		t.Fatal("compaction changed live file contents")
+	}
+}
+
+func TestPVLT0002UpgradesOnFirstMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.vault")
+	data := []byte("old data")
+	header, aead, err := newStreamCipher(testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := Entry{Name: "old.bin", Size: int64(len(data)), Hash: hashString(data)}
+	if err := writeInitialStream(path, header, aead, []Entry{entry}, nil, map[string]io.Reader{"old.bin": bytes.NewReader(data)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Service{}).Delete(path, testPassword, "old.bin"); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var magic [8]byte
+	_, _ = io.ReadFull(file, magic[:])
+	_ = file.Close()
+	if string(magic[:]) != streamV3Magic {
+		t.Fatalf("expected first mutation to upgrade to PVLT0003, got %q", magic)
+	}
+}
+
+func TestPVLT0003AppendImportKeepsExistingPayloadOffset(t *testing.T) {
+	collection, _ := createTestVault(t, []byte("already stored"))
+	before, err := (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldOffset := before.Items()[0].Offset
+	_ = before.Close()
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "new.bin"), []byte("append me"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Service{}).Create(CreateOptions{Source: source, Destination: filepath.Dir(collection), Key: testPassword}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := (Service{}).OpenSession(collection, testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer after.Close()
+	var gotOffset int64
+	for _, item := range after.Items() {
+		if item.Name == "file.bin" {
+			gotOffset = item.Offset
+		}
+	}
+	if gotOffset != oldOffset {
+		t.Fatalf("existing payload moved during append: before=%d after=%d", oldOffset, gotOffset)
+	}
+	reader, err := after.Open("new.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = reader.Close()
+}
+
 func TestEntryCountLimitIsSymmetric(t *testing.T) {
 	entries := make([]Entry, maxEntries+1)
 	output, err := os.CreateTemp(t.TempDir(), "index-limit-*")
@@ -330,6 +497,9 @@ func TestEntryCountLimitIsSymmetric(t *testing.T) {
 	_ = output.Close()
 	if err == nil || !strings.Contains(err.Error(), "too many items") {
 		t.Fatalf("writer should reject %d entries, got %v", len(entries), err)
+	}
+	if err := appendStreamV3Contents(output, nil, nil, nil, entries, nil, nil, streamV3Commit{}); err == nil || !strings.Contains(err.Error(), "too many items") {
+		t.Fatalf("PVLT0003 writer should reject %d entries, got %v", len(entries), err)
 	}
 	plain, err := json.Marshal(streamManifest{Entries: entries})
 	if err != nil {
@@ -407,6 +577,38 @@ func FuzzStreamIndexParser(f *testing.F) {
 			t.Fatal(err)
 		}
 		_, _, _, _, _ = readStreamIndexFile(file, "fuzz-key")
+		_ = file.Close()
+	})
+}
+
+func FuzzStreamV3CommitParser(f *testing.F) {
+	header, aead, err := newStreamV3Cipher("fuzz-key")
+	if err != nil {
+		f.Fatal(err)
+	}
+	seedPath := filepath.Join(f.TempDir(), "seed-v3.vault")
+	if err := createStreamV3Atomically(seedPath, header, aead, nil, nil, nil); err != nil {
+		f.Fatal(err)
+	}
+	seed, err := os.ReadFile(seedPath)
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed)
+	f.Add([]byte(streamV3Magic))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 20<<20 {
+			t.Skip()
+		}
+		path := filepath.Join(t.TempDir(), "fuzz-v3.vault")
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, _, _, _, _ = readStreamV3IndexFile(file, "fuzz-key")
 		_ = file.Close()
 	})
 }

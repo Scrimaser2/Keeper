@@ -266,7 +266,7 @@ func ensureStreamFormatLocked(path, password string) error {
 	if readErr != nil {
 		return readErr
 	}
-	if string(magicBytes[:]) == streamMagic {
+	if string(magicBytes[:]) == streamMagic || string(magicBytes[:]) == streamV3Magic {
 		return nil
 	}
 	if string(magicBytes[:]) != magic {
@@ -372,6 +372,14 @@ func readStreamIndex(path, password string) ([]byte, cipher.AEAD, []Entry, []Tag
 }
 
 func readStreamIndexFile(file *os.File, password string) ([]byte, cipher.AEAD, []Entry, []Tag, error) {
+	var fileMagic [8]byte
+	if _, err := file.ReadAt(fileMagic[:], 0); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if string(fileMagic[:]) == streamV3Magic {
+		header, aead, entries, tags, _, err := readStreamV3IndexFile(file, password)
+		return header, aead, entries, tags, err
+	}
 	reader := io.NewSectionReader(file, 0, 1<<63-1)
 	info, err := file.Stat()
 	if err != nil {
@@ -422,7 +430,7 @@ func readStreamIndexFile(file *os.File, password string) ([]byte, cipher.AEAD, [
 	if err != nil {
 		return nil, nil, nil, nil, errors.New("decryption failed (wrong key or damaged collection)")
 	}
-	entries, tags, err := parseStreamManifest(plain, indexOffset)
+	entries, tags, err := parseStreamManifestWithHeader(plain, indexOffset, streamHeaderSize)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -430,6 +438,10 @@ func readStreamIndexFile(file *os.File, password string) ([]byte, cipher.AEAD, [
 }
 
 func parseStreamManifest(plain []byte, indexOffset int64) ([]Entry, []Tag, error) {
+	return parseStreamManifestWithHeader(plain, indexOffset, streamHeaderSize)
+}
+
+func parseStreamManifestWithHeader(plain []byte, indexOffset, headerSize int64) ([]Entry, []Tag, error) {
 	var manifest streamManifest
 	if err := json.Unmarshal(plain, &manifest); err != nil {
 		return nil, nil, fmt.Errorf("invalid collection index: %w", err)
@@ -437,7 +449,7 @@ func parseStreamManifest(plain []byte, indexOffset int64) ([]Entry, []Tag, error
 	if err := validateEntryCount(len(manifest.Entries)); err != nil {
 		return nil, nil, err
 	}
-	if err := validateStreamEntries(manifest.Entries, indexOffset); err != nil {
+	if err := validateStreamEntriesFrom(manifest.Entries, indexOffset, headerSize); err != nil {
 		return nil, nil, err
 	}
 	return manifest.Entries, makeTagCatalog(manifest.Tags, tagsFromEntries(manifest.Entries)), nil
@@ -451,6 +463,10 @@ func validateEntryCount(count int) error {
 }
 
 func validateStreamEntries(entries []Entry, indexOffset int64) error {
+	return validateStreamEntriesFrom(entries, indexOffset, streamHeaderSize)
+}
+
+func validateStreamEntriesFrom(entries []Entry, indexOffset, headerSize int64) error {
 	seen := make(map[string]struct{}, len(entries))
 	ordered := append([]Entry(nil), entries...)
 	for _, entry := range ordered {
@@ -459,7 +475,7 @@ func validateStreamEntries(entries []Entry, indexOffset int64) error {
 			return fmt.Errorf("unsafe path in collection: %q", entry.Name)
 		}
 		recordSize := encodedRecordSize(entry.Size)
-		if entry.Size < 0 || recordSize < 0 || entry.Offset < streamHeaderSize || entry.Offset > indexOffset || recordSize > indexOffset-entry.Offset {
+		if entry.Size < 0 || recordSize < 0 || entry.Offset < headerSize || entry.Offset > indexOffset || recordSize > indexOffset-entry.Offset {
 			return fmt.Errorf("invalid item bounds in collection: %q", entry.Name)
 		}
 		if _, exists := seen[entry.Name]; exists {
@@ -536,6 +552,15 @@ func rewriteStreamWithTags(path string, password string, entries []Entry, tags [
 		if old, ok := oldByName[entries[i].Name]; ok {
 			entries[i].Offset = old.Offset
 		}
+	}
+	if len(header) >= 8 && string(header[:8]) == streamMagic {
+		if err := upgradeStreamV2ToV3(path, password); err != nil {
+			return err
+		}
+		return appendStreamV3Transaction(path, password, entries, tags, nil)
+	}
+	if len(header) >= 8 && string(header[:8]) == streamV3Magic {
+		return appendStreamV3Transaction(path, password, entries, tags, nil)
 	}
 	return writeStreamAtomically(path, header, aead, oldEntries, entries, tags, nil)
 }

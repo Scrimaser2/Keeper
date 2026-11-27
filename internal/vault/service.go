@@ -82,6 +82,7 @@ func (Service) Create(options CreateOptions) (CreateResult, error) {
 	var tagCatalog []Tag
 	var header []byte
 	var aead cipher.AEAD
+	isV3 := false
 	if _, err := os.Stat(collectionPath); err == nil {
 		if err := ensureStreamFormatLocked(collectionPath, options.Key); err != nil {
 			return result, err
@@ -90,13 +91,15 @@ func (Service) Create(options CreateOptions) (CreateResult, error) {
 		if err != nil {
 			return result, err
 		}
+		isV3 = len(header) >= 8 && string(header[:8]) == streamV3Magic
 	} else if !os.IsNotExist(err) {
 		return result, err
 	} else {
-		header, aead, err = newStreamCipher(options.Key)
+		header, aead, err = newStreamV3Cipher(options.Key)
 		if err != nil {
 			return result, err
 		}
+		isV3 = true
 	}
 
 	entriesByName := make(map[string]Entry, len(oldEntries))
@@ -168,13 +171,34 @@ func (Service) Create(options CreateOptions) (CreateResult, error) {
 	for name, path := range sourcePaths {
 		sources[name] = &lazyFileReader{path: path}
 	}
-	if err := writeStreamAtomically(collectionPath, header, aead, oldEntries, entries, tagCatalog, sources); err != nil {
+	if !isV3 {
+		if err := upgradeStreamV2ToV3(collectionPath, options.Key); err != nil {
+			for _, source := range sources {
+				if closer, ok := source.(io.Closer); ok {
+					_ = closer.Close()
+				}
+			}
+			return result, err
+		}
+		isV3 = true
+	}
+	var writeErr error
+	if isV3 {
+		if _, statErr := os.Stat(collectionPath); os.IsNotExist(statErr) {
+			writeErr = createStreamV3Atomically(collectionPath, header, aead, entries, tagCatalog, sources)
+		} else {
+			writeErr = appendStreamV3Transaction(collectionPath, options.Key, entries, tagCatalog, sources)
+		}
+	} else {
+		writeErr = writeStreamAtomically(collectionPath, header, aead, oldEntries, entries, tagCatalog, sources)
+	}
+	if writeErr != nil {
 		for _, source := range sources {
 			if closer, ok := source.(io.Closer); ok {
 				_ = closer.Close()
 			}
 		}
-		return result, err
+		return result, writeErr
 	}
 	for _, source := range sources {
 		if closer, ok := source.(io.Closer); ok {
@@ -329,6 +353,36 @@ func (Service) Delete(path, key, name string) error {
 	return rewriteStream(path, key, remaining)
 }
 
+// Compact rewrites a PVLT0003 collection with only live item records.
+func (Service) Compact(path, key string) error {
+	unlock, err := lockCollection(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := ensureStreamFormatLocked(path, key); err != nil {
+		return err
+	}
+	var magic [8]byte
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	_, readErr := io.ReadFull(file, magic[:])
+	_ = file.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if string(magic[:]) == streamMagic {
+		if err := upgradeStreamV2ToV3(path, key); err != nil {
+			return err
+		}
+	} else if string(magic[:]) != streamV3Magic {
+		return errors.New("compaction requires a PVLT0002 or PVLT0003 collection")
+	}
+	return compactStreamV3(path, key)
+}
+
 func (Service) AddTag(path, key, tag string, names []string) (int, error) {
 	unlock, err := lockCollection(path)
 	if err != nil {
@@ -379,7 +433,12 @@ func (Service) AddTag(path, key, tag string, names []string) (int, error) {
 }
 
 func (Service) ListTags(path, key string) ([]Tag, error) {
-	if err := ensureStreamFormat(path, key); err != nil {
+	unlock, err := lockCollection(path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if err := ensureStreamFormatLocked(path, key); err != nil {
 		return nil, err
 	}
 	_, _, _, tags, err := readStreamIndex(path, key)

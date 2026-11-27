@@ -20,6 +20,7 @@ race:
 fuzz:
 	$(GO) test ./internal/vault -run '^$$' -fuzz '^FuzzLegacyVaultDecoder$$' -fuzztime=$(FUZZTIME)
 	$(GO) test ./internal/vault -run '^$$' -fuzz '^FuzzStreamIndexParser$$' -fuzztime=$(FUZZTIME)
+	$(GO) test ./internal/vault -run '^$$' -fuzz '^FuzzStreamV3CommitParser$$' -fuzztime=$(FUZZTIME)
 	$(GO) test ./internal/vault -run '^$$' -fuzz '^FuzzDecryptedStreamManifest$$' -fuzztime=$(FUZZTIME)
 
 bench:
