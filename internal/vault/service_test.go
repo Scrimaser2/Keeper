@@ -406,7 +406,8 @@ func FuzzDecryptedStreamManifest(f *testing.F) {
 	})
 }
 
-func BenchmarkStreamReadMemory(b *testing.B) {
+// BenchmarkStreamReadSampledHeap samples Go HeapAlloc; it does not measure process RSS.
+func BenchmarkStreamReadSampledHeap(b *testing.B) {
 	root := b.TempDir()
 	source, destination := filepath.Join(root, "source"), filepath.Join(root, "container")
 	if err := os.Mkdir(source, 0700); err != nil {
@@ -421,7 +422,7 @@ func BenchmarkStreamReadMemory(b *testing.B) {
 	}
 	path := filepath.Join(destination, archiveName)
 	b.ReportAllocs()
-	b.ReportMetric(0, "peak-heap-B")
+	b.ReportMetric(0, "sampled-heap-delta-B")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		runtime.GC()
@@ -450,7 +451,7 @@ func BenchmarkStreamReadMemory(b *testing.B) {
 				b.Fatal(readErr)
 			}
 		}
-		b.ReportMetric(float64(peak-before.HeapAlloc), "peak-heap-B")
+		b.ReportMetric(float64(peak-before.HeapAlloc), "sampled-heap-delta-B")
 		_ = reader.Close()
 		_ = session.Close()
 	}

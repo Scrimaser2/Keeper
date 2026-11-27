@@ -4,6 +4,11 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 DIST="$ROOT/dist"
 APP="$DIST/Library.app"
+APP_VERSION="$(tr -d '\r\n' < "$ROOT/VERSION")"
+if ! printf '%s\n' "$APP_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+	echo "Invalid VERSION: $APP_VERSION (expected MAJOR.MINOR.PATCH)" >&2
+	exit 1
+fi
 TEMP_BUILD="$(mktemp -d "${TMPDIR:-/tmp}/library-build.XXXXXX")"
 ICONSET="$TEMP_BUILD/AppIcon.iconset"
 trap 'rm -rf "$TEMP_BUILD"' EXIT HUP INT TERM
@@ -30,8 +35,8 @@ payload = b"".join(chunks)
 output.write_bytes(b"icns" + struct.pack(">I", len(payload) + 8) + payload)
 PYTHON
 
-GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o "$TEMP_BUILD/Library-arm64" "$ROOT"
-GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o "$TEMP_BUILD/Library-amd64" "$ROOT"
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 go build -trimpath -ldflags="-s -w -X photovault/internal/buildinfo.Version=$APP_VERSION" -o "$TEMP_BUILD/Library-arm64" "$ROOT"
+GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 go build -trimpath -ldflags="-s -w -X photovault/internal/buildinfo.Version=$APP_VERSION" -o "$TEMP_BUILD/Library-amd64" "$ROOT"
 /usr/bin/lipo -create "$TEMP_BUILD/Library-arm64" "$TEMP_BUILD/Library-amd64" -output "$APP/Contents/MacOS/Library"
 chmod 755 "$APP/Contents/MacOS/Library"
 
@@ -45,7 +50,7 @@ done
 	-output "$APP/Contents/Helpers/LibraryMediaViewer"
 chmod 755 "$APP/Contents/Helpers/LibraryMediaViewer"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -57,8 +62,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleName</key><string>Library</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>1.0</string>
-	<key>CFBundleVersion</key><string>1</string>
+	<key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
+	<key>CFBundleVersion</key><string>$APP_VERSION</string>
 	<key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
 	<key>LSMinimumSystemVersion</key><string>11.0</string>
 	<key>NSHighResolutionCapable</key><true/>

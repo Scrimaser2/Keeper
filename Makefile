@@ -23,4 +23,4 @@ fuzz:
 	$(GO) test ./internal/vault -run '^$$' -fuzz '^FuzzDecryptedStreamManifest$$' -fuzztime=$(FUZZTIME)
 
 bench:
-	$(GO) test ./internal/vault -run '^$$' -bench '^BenchmarkStreamReadMemory$$' -benchmem -benchtime=1x
+	$(GO) test ./internal/vault -run '^$$' -bench '^BenchmarkStreamReadSampledHeap$$' -benchmem -benchtime=1x

@@ -600,6 +600,12 @@ func writeStreamAtomically(path string, header []byte, aead cipher.AEAD, oldEntr
 	if err := temp.Close(); err != nil {
 		return err
 	}
+	if oldFile != nil {
+		if err := oldFile.Close(); err != nil {
+			return fmt.Errorf("close previous collection before replacement: %w", err)
+		}
+		oldFile = nil
+	}
 	return os.Rename(tempPath, path)
 }
 

@@ -40,3 +40,7 @@ photovault type=decrypt in="/path/to/vault-dir/photos.vault" out="/path/to/resto
 - `scripts` — сборка `.app` и native helper для Quick Look, PDF и видео.
 
 UI и CLI используют один сервис `vault`; представление не содержит кода формата или шифрования.
+
+## Версия приложения
+
+Единственный источник версии — корневой файл `VERSION` в формате `MAJOR.MINOR.PATCH`. Исправления повышают PATCH, обратно совместимые функции — MINOR, несовместимые изменения — MAJOR. `make build` записывает значение в метаданные `.app` и встраивает его в CLI; `photovault --version` выводит встроенную версию. При подготовке следующего релиза обновляйте `VERSION` вместе с изменениями.
